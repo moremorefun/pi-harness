@@ -49,6 +49,22 @@ function formatContext(usage?: { tokens: number | null; contextWindow: number; p
 	return `${formatTokens(usage.tokens)}/${formatTokens(usage.contextWindow)} (${usage.percent.toFixed(1)}%)`;
 }
 
+function wrapUsageParts(parts: string[], width: number): string[] {
+	const lines: string[] = [];
+	let current: string[] = [];
+	for (const part of parts) {
+		const candidate = [...current, part].join(" · ");
+		if (current.length > 0 && visibleWidth(candidate) > width) {
+			lines.push(current.join(" · "));
+			current = [part];
+		} else {
+			current.push(part);
+		}
+	}
+	if (current.length > 0) lines.push(current.join(" · "));
+	return lines;
+}
+
 function formatDuration(milliseconds: number): string {
 	const totalSeconds = Math.floor(milliseconds / 1_000);
 	const hours = Math.floor(totalSeconds / 3_600);
@@ -399,14 +415,15 @@ export default function footerExtension(pi: ExtensionAPI): void {
 					const thinking = String(ctx.thinkingLevel ?? "off");
 					const thinkingColor = THINKING_COLORS[thinking as keyof typeof THINKING_COLORS];
 					const ellipsis = theme.fg("dim", "…");
-					const usage = theme.fg("dim", [
+					const usageParts = [
 						`↑ ${formatTokens(input)}`,
 						`↓ ${formatTokens(output)}`,
 						`↺ ${cacheRate === undefined ? "—" : `${cacheRate.toFixed(1)}%`}`,
 						`⚡ ${tps === undefined ? "—" : `${tps.toFixed(1)} t/s`}`,
-					`$ ${cost.toFixed(3)}`,
+						`$ ${cost.toFixed(3)}`,
 						`◔ ${formatContext(contextUsage)}`,
-					].join(" · "));
+					];
+					const usage = theme.fg("dim", usageParts.join(" · "));
 					const thinkingText = thinking === "ultra"
 						? rainbow(thinking)
 						: thinkingColor === undefined ? theme.fg("dim", thinking) : color(thinking, thinkingColor);
@@ -421,9 +438,13 @@ export default function footerExtension(pi: ExtensionAPI): void {
 					const checkoutStatus = gitSummary.badges ? `${checkoutLink} ${theme.fg("dim", gitSummary.badges)}` : checkoutLink;
 					const identityLine = prStatus ? `${identity}${checkoutStatus} · ${prStatus}` : `${identity}${checkoutStatus}`;
 					const firstLine = henryStatuses.length ? align(identityLine, henryStatuses.join(" "), width, ellipsis) : identityLine;
+					const fitsSingleLine = visibleWidth(usage) + visibleWidth(model) + 2 <= width;
+					const usageLines = fitsSingleLine
+						? [align(usage, model, width, ellipsis)]
+						: [...wrapUsageParts(usageParts, width).map((line) => theme.fg("dim", line)), model];
 					const lines = [
 						firstLine,
-						align(usage, model, width, ellipsis),
+						...usageLines,
 						alignRightReserved([codegraph, ...externalStatuses].filter(Boolean).join(" · "), runtime, width, ellipsis),
 					];
 					return lines.map((line) => truncateToWidth(line, width, ellipsis));

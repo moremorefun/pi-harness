@@ -139,7 +139,7 @@ test("renders family status on the first line and external statuses beside runti
 	assert.doesNotMatch(rendered[2]!, /PR #123|Codex/);
 
 	// Narrow width: external status truncates first so the runtime stays visible.
-	const narrow = stripTerminalSequences(footer.render(30)[2]!);
+	const narrow = stripTerminalSequences(footer.render(30).at(-1)!);
 	assert.match(narrow, /◷ 0s$/);
 
 	extensionStatuses = new Map([["pi-rewind", "↩ rewind"]]);
@@ -179,6 +179,10 @@ test("renders family status on the first line and external statuses beside runti
 	entries = [];
 	assert.match(footer.render(100)[1], /↺ —(?: ·|$)/);
 	assert.doesNotMatch(footer.render(100)[1], /\?%/);
+	const multiLineRender = footer.render(70);
+	assert.equal(multiLineRender.length, 4);
+	assert.match(stripTerminalSequences(multiLineRender[1]!), /^↑ 0 · ↓ 0 · ↺ — · ⚡ — · \$ 0.000 · ◔ 84.7k\/200.0k \(42.3%\)$/);
+	assert.match(stripTerminalSequences(multiLineRender[2]!), /^gpt-5.6-luna • ultra$/);
 	footer.dispose();
 	assert.equal(disposed, true);
 
