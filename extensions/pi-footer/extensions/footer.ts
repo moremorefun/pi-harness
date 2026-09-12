@@ -43,6 +43,12 @@ function formatTokens(count: number): string {
 	return `${(count / 1_000_000).toFixed(1)}M`;
 }
 
+function formatContext(usage?: { tokens: number | null; contextWindow: number; percent: number | null }): string {
+	if (!usage || usage.percent == null) return "—";
+	if (usage.tokens == null) return `${usage.percent.toFixed(1)}%`;
+	return `${formatTokens(usage.tokens)}/${formatTokens(usage.contextWindow)} (${usage.percent.toFixed(1)}%)`;
+}
+
 function formatDuration(milliseconds: number): string {
 	const totalSeconds = Math.floor(milliseconds / 1_000);
 	const hours = Math.floor(totalSeconds / 3_600);
@@ -373,7 +379,7 @@ export default function footerExtension(pi: ExtensionAPI): void {
 
 					const reportedBranch = data.getGitBranch()?.replace(/^worktree\//, "");
 					const branch = reportedBranch === "detached" && gitSummary.detachedOid ? `@${gitSummary.detachedOid}` : reportedBranch;
-					const context = ctx.getContextUsage()?.percent;
+					const contextUsage = ctx.getContextUsage();
 					const openUri = configuredOpenUri(ctx.cwd);
 					const extensionStatuses = data.getExtensionStatuses();
 					const prStatus = sanitizeStatus(extensionStatuses.get("pi-pr") ?? "");
@@ -399,7 +405,7 @@ export default function footerExtension(pi: ExtensionAPI): void {
 						`↺ ${cacheRate === undefined ? "—" : `${cacheRate.toFixed(1)}%`}`,
 						`⚡ ${tps === undefined ? "—" : `${tps.toFixed(1)} t/s`}`,
 					`$ ${cost.toFixed(3)}`,
-						`◔ ${context == null ? "—" : `${context.toFixed(1)}%`}`,
+						`◔ ${formatContext(contextUsage)}`,
 					].join(" · "));
 					const thinkingText = thinking === "ultra"
 						? rainbow(thinking)
