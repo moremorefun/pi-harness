@@ -1,7 +1,7 @@
 import { readFile } from "node:fs/promises";
 import { basename, dirname, join } from "node:path";
 import type { ExtensionAPI, Theme } from "@earendil-works/pi-coding-agent";
-import { getCapabilities, hyperlink, truncateToWidth, visibleWidth } from "@earendil-works/pi-tui";
+import { getCapabilities, hyperlink, stripTerminalSequences, truncateToWidth, visibleWidth } from "@earendil-works/pi-tui";
 import { configuredOpenUri } from "@henryqw/pi-open-in/open-uri";
 
 const THINKING_COLORS = {
@@ -74,7 +74,12 @@ function formatDuration(milliseconds: number): string {
 }
 
 function sanitizeStatus(text: string): string {
-	return text.replace(/[\r\n]+/g, " ").trim();
+	const cleaned = text
+		.replace(/\x1b\[(?:4[0-9]|10[0-7]|48(?:;[0-9]+)*)m/g, "")
+		.replace(/\x1b\[38;2;11;70;110m/g, "")
+		.replace(/[\r\n]+/g, " ");
+	if (!stripTerminalSequences(cleaned).trim()) return "";
+	return cleaned.replace(/^\s+|\s+(?=(\x1b\[[0-9;]*m)*$)/g, "").trim();
 }
 
 function summarizeGitStatus(output: string, operation?: string): GitSummary {

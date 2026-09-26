@@ -514,3 +514,36 @@ test("restores cumulative agent time on resume and appends updated totals", asyn
 		globalThis.performance = realPerformance;
 	}
 });
+
+test("strips background ANSI styling and cleans external statuses", async () => {
+	const { start } = setupFooter();
+	const ctx = {
+		mode: "tui",
+		cwd: "/repo",
+		sessionManager: { getEntries: () => [] },
+		getContextUsage: () => undefined,
+	};
+	const footerFactory = await start(ctx);
+	const extensionStatuses = new Map([
+		["background-tasks", "\x1b[48;2;183;223;255m\x1b[38;2;11;70;110m bg 1 running · 3 failed · Shift↓ \x1b[0m"],
+		["blank", "   \x1b[0m   "],
+		["styled", "\x1b[32mhealthy\x1b[39m"],
+	]);
+	const footer = footerFactory(
+		{ requestRender() {} },
+		{ fg: (_color, text) => text },
+		{
+			getGitBranch: () => "main",
+			getExtensionStatuses: () => extensionStatuses,
+			onBranchChange: () => () => {},
+		},
+	);
+	const line = footer.render(100)[2]!;
+	assert.match(stripTerminalSequences(line), /^bg 1 running · 3 failed · Shift↓ styled:healthy|healthy.*◷ 0s$/);
+	assert.match(line, /bg 1 running · 3 failed · Shift↓/);
+	assert.doesNotMatch(line, /\x1b\[48;/);
+	assert.doesNotMatch(line, /\x1b\[38;2;11;70;110m/);
+	assert.doesNotMatch(line, /blank/);
+	assert.match(line, /\x1b\[32mhealthy\x1b\[39m/);
+	footer.dispose();
+});
