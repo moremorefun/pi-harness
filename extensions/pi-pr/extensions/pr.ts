@@ -8,12 +8,14 @@ import {
 } from "@earendil-works/pi-coding-agent";
 import { truncateToWidth } from "@earendil-works/pi-tui";
 import { createHerdrClient } from "@henryqw/pi-herdr";
-import { Type } from "typebox";
+import { Type, type Static, type TObject, type TSchema, type TUnion } from "typebox";
+import { Check, Errors } from "typebox/value";
 import { PullRequestCiFixer, type PullRequestCiFixOptions } from "./pr-ci.ts";
 import { PullRequestCommentSweep, type PullRequestCommentSweepOptions } from "./pr-comment-sweep.ts";
 import { needsFeedbackAttention } from "./pr-feedback-attention.ts";
 import {
 	createPrCommandHandler,
+	WORKFLOW_ROUTES,
 	type PrCommandDependencies,
 	type PrCommandInvocation,
 	type WorkflowPromptIdentity,
@@ -30,8 +32,7 @@ import {
 } from "./pr-github.ts";
 import { isRecord, parseSingleOutputLine, runChecked } from "./pr-execution.ts";
 import {
-	discoveryIssueKey,
-	discoveryIssueMessage,
+	discoveryIssueDetails,
 	formatPrFooter,
 	formatPrWidget,
 	projectPrDisplay,
@@ -49,7 +50,6 @@ const OBSERVATION_ENTRY = "pi-pr-observation";
 const GH_PR_CREATE = /(?:^|[;&|]\s*|\n\s*)gh\s+pr\s+create(?=\s|$|[;&|])/;
 const GIT_COMMIT = /(?:^|[;&|]\s*|\n\s*)git\s+commit(?=\s|$|[;&|])/;
 const GIT_PUSH = /(?:^|[;&|]\s*|\n\s*)git\s+push(?=\s|$|[;&|])/;
-const WORKFLOW_ROUTES = new Set(["create", "publish-work", "update-branch", "sweep", "fix-ci"]);
 const DELEGATED_TOOLS = new Set(["delegate_task"]);
 const CLOSED = { additionalProperties: false } as const;
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/;
@@ -77,12 +77,38 @@ const SweepChecks = Type.Array(Type.Object({
 	args: Type.Array(Type.String({ maxLength: 4_096 }), { maxItems: 256 }),
 }, CLOSED), { maxItems: 32 });
 
-const UpdateBranchParameters = Type.Union([
+// Strict OpenAI-compatible endpoints reject a parameters root without type "object", and Claude Code
+// drops tools whose root is a union. Register a flat object root derived from the per-action variants
+// and enforce the exact variant at execution (also after any before_tool argument replacement).
+function flatRoot(actions: TUnion<TObject[]>): TObject {
+	const properties = new Map<string, TSchema[]>();
+	const requiredCount = new Map<string, number>();
+	for (const variant of actions.anyOf) {
+		for (const [key, schema] of Object.entries(variant.properties)) {
+			const seen = properties.get(key) ?? [];
+			if (!seen.some((candidate) => JSON.stringify(candidate) === JSON.stringify(schema))) seen.push(schema);
+			properties.set(key, seen);
+			if (variant.required?.includes(key)) requiredCount.set(key, (requiredCount.get(key) ?? 0) + 1);
+		}
+	}
+	return Type.Object(Object.fromEntries([...properties].map(([key, schemas]) => {
+		const schema = schemas.length === 1 ? schemas[0]! : Type.Union(schemas);
+		return [key, requiredCount.get(key) === actions.anyOf.length ? schema : Type.Optional(schema)];
+	})), CLOSED);
+}
+
+function checkedAction<T extends TUnion<TObject[]>>(actions: T, args: unknown): Static<T> {
+	if (Check(actions, args)) return args as Static<T>;
+	const issue = [...Errors(actions, args)][0];
+	throw new Error(`Tool arguments do not match one action${issue ? `: ${issue.message}` : ""}`);
+}
+
+const UpdateBranchActions = Type.Union([
 	Type.Object({ runId: RouteRunId, action: Type.Literal("rebase") }, CLOSED),
 	Type.Object({ runId: RouteRunId, action: Type.Literal("continue"), resolvedPaths: ResolvedPaths }, CLOSED),
 	Type.Object({ runId: RouteRunId, action: Type.Literal("publish") }, CLOSED),
 ]);
-const CreateParameters = Type.Union([
+const CreateActions = Type.Union([
 	Type.Object({ runId: RouteRunId, action: Type.Literal("prepare") }, CLOSED),
 	Type.Object({ runId: RouteRunId, action: Type.Literal("inspect") }, CLOSED),
 	Type.Object({ runId: RouteRunId, action: Type.Literal("commit"), ownedPaths: OwnedPaths, message: Type.String({ minLength: 1, maxLength: 256 }) }, CLOSED),
@@ -95,7 +121,7 @@ const CreateParameters = Type.Union([
 		body: Type.String({ maxLength: 65_536 }),
 	}, CLOSED),
 ]);
-const SweepParameters = Type.Union([
+const SweepActions = Type.Union([
 	Type.Object({ runId: RouteRunId, action: Type.Literal("start") }, CLOSED),
 	Type.Object({ runId: RouteRunId, action: Type.Literal("resume") }, CLOSED),
 	Type.Object({ runId: RouteRunId, action: Type.Literal("show"), guard: SweepGuard, id: Type.String({ minLength: 1, maxLength: 1_024 }) }, CLOSED),
@@ -106,25 +132,26 @@ const SweepParameters = Type.Union([
 		ledger: SweepLedger,
 		ownedPaths: Type.Optional(OwnedPaths),
 	}, CLOSED),
+	Type.Object({ runId: RouteRunId, action: Type.Literal("commit"), guard: SweepGuard, message: Type.String({ minLength: 1, maxLength: 256 }) }, CLOSED),
 	Type.Object({ runId: RouteRunId, action: Type.Literal("publish"), guard: SweepGuard }, CLOSED),
 	Type.Object({ runId: RouteRunId, action: Type.Literal("refresh"), guard: SweepGuard }, CLOSED),
 	Type.Object({ runId: RouteRunId, action: Type.Literal("resolve"), guard: SweepGuard }, CLOSED),
 	Type.Object({ runId: RouteRunId, action: Type.Literal("finalize"), guard: SweepGuard, checks: SweepChecks }, CLOSED),
 ]);
-const WorkParameters = Type.Union([
+const WorkActions = Type.Union([
 	Type.Object({ runId: RouteRunId, action: Type.Literal("inspect") }, CLOSED),
 	Type.Object({ runId: RouteRunId, action: Type.Literal("commit"), ownedPaths: OwnedPaths, message: Type.String({ minLength: 1, maxLength: 256 }) }, CLOSED),
 	Type.Object({ runId: RouteRunId, action: Type.Literal("validate"), checks: SweepChecks }, CLOSED),
 	Type.Object({ runId: RouteRunId, action: Type.Literal("publish") }, CLOSED),
 ]);
-const FixCiParameters = Type.Union([
+const FixCiActions = Type.Union([
 	Type.Object({ runId: RouteRunId, action: Type.Literal("collect") }, CLOSED),
 	Type.Object({ runId: RouteRunId, action: Type.Literal("publish") }, CLOSED),
 ]);
 
 type UpdateBranchWorkflow = Pick<PullRequestBranchUpdater, "state" | "recoveryLaunchAction" | "rebase" | "continue" | "publish">;
 type CreateWorkflow = Pick<PullRequestCreator, "state" | "prepare" | "inspect" | "commit" | "verify" | "push" | "publish">;
-type SweepWorkflow = Pick<PullRequestCommentSweep, "recoveryLaunchAction" | "start" | "resume" | "show" | "record" | "publish" | "refresh" | "resolve" | "finalize">;
+type SweepWorkflow = Pick<PullRequestCommentSweep, "recoveryLaunchAction" | "start" | "resume" | "show" | "record" | "commit" | "publish" | "refresh" | "resolve" | "finalize">;
 type FixCiWorkflow = Pick<PullRequestCiFixer, "collect" | "publish">;
 
 type WorkflowContextBase = {
@@ -246,15 +273,9 @@ export default function pullRequestExtension(
 	const newRunId = dependencies.newRunId ?? randomUUID;
 	let context: ExtensionContext | undefined;
 	let observation: PullRequestObservation | undefined;
-	const load: typeof loadCurrentPullRequest = async (
-		api,
-		loadContext,
-		inspectedLocal,
-		_observed,
-		explicitCreationBase,
-	) => {
+	const load: typeof loadCurrentPullRequest = async (api, loadContext, inspectedLocal) => {
 		const generation = sessionGeneration;
-		const discovery = await discover(api, loadContext, inspectedLocal, observation, explicitCreationBase);
+		const discovery = await discover(api, loadContext, inspectedLocal, observation);
 		if (generation !== sessionGeneration) return discovery;
 		if (discovery.kind === "current") {
 			const current = pullRequestObservation(discovery.pullRequest);
@@ -301,7 +322,6 @@ export default function pullRequestExtension(
 		invocation.assertCurrent();
 		if (workflowContext) throw new Error(`PR workflow ${workflowContext.runId} is still active`);
 		const runId = newRunId();
-		if (!UUID.test(runId)) throw new Error("PR workflow runId generator returned an invalid UUID");
 		const common: WorkflowContextBase = {
 			runId,
 			sessionGeneration: invocation.sessionGeneration,
@@ -431,6 +451,8 @@ export default function pullRequestExtension(
 			selected.controller.signal.throwIfAborted();
 			if (worktree !== selected.worktree) throw new Error("PR workflow worktree is wrong or stale");
 			selected.usedSinceSettlement = true;
+			// Drained follow-ups need not emit before_agent_start; this run has been consumed.
+			selected.queuedPrompt = undefined;
 			return toolResult(await action(selected as Extract<WorkflowContext, { route: Route }>));
 		} finally {
 			signal?.removeEventListener("abort", abortRun);
@@ -441,9 +463,10 @@ export default function pullRequestExtension(
 		name: "pi_pr_update_branch",
 		label: "Update PR Branch",
 		description: "Run one guarded action for the /pr branch-update route.",
-		parameters: UpdateBranchParameters,
+		parameters: flatRoot(UpdateBranchActions),
 		executionMode: "sequential",
-		async execute(_toolCallId, params, signal, _onUpdate, ctx) {
+		async execute(_toolCallId, raw, signal, _onUpdate, ctx) {
+			const params = checkedAction(UpdateBranchActions, raw);
 			return executeWorkflowAction(params.runId, "update-branch", ctx, signal, async (selected) => {
 				switch (params.action) {
 					case "rebase": return await selected.workflow.rebase();
@@ -462,9 +485,10 @@ export default function pullRequestExtension(
 		name: "pi_pr_create",
 		label: "Create Pull Request",
 		description: "Run one guarded action for the /pr creation route.",
-		parameters: CreateParameters,
+		parameters: flatRoot(CreateActions),
 		executionMode: "sequential",
-		async execute(_toolCallId, params, signal, _onUpdate, ctx) {
+		async execute(_toolCallId, raw, signal, _onUpdate, ctx) {
+			const params = checkedAction(CreateActions, raw);
 			return executeWorkflowAction(params.runId, "create", ctx, signal, async (selected) => {
 				switch (params.action) {
 					case "prepare": return await selected.workflow.prepare();
@@ -486,9 +510,10 @@ export default function pullRequestExtension(
 		name: "pi_pr_publish_work",
 		label: "Publish PR Work",
 		description: "Inspect, commit, validate, and publish only reviewed local work for the /pr route.",
-		parameters: WorkParameters,
+		parameters: flatRoot(WorkActions),
 		executionMode: "sequential",
-		async execute(_toolCallId, params, signal, _onUpdate, ctx) {
+		async execute(_toolCallId, raw, signal, _onUpdate, ctx) {
+			const params = checkedAction(WorkActions, raw);
 			return executeWorkflowAction(params.runId, "publish-work", ctx, signal, async (selected) => {
 				switch (params.action) {
 					case "inspect": return await selected.workflow.inspect();
@@ -508,15 +533,17 @@ export default function pullRequestExtension(
 		name: "pi_pr_sweep",
 		label: "Sweep PR Feedback",
 		description: "Run one guarded action for the /pr feedback route.",
-		parameters: SweepParameters,
+		parameters: flatRoot(SweepActions),
 		executionMode: "sequential",
-		async execute(_toolCallId, params, signal, _onUpdate, ctx) {
+		async execute(_toolCallId, raw, signal, _onUpdate, ctx) {
+			const params = checkedAction(SweepActions, raw);
 			return executeWorkflowAction(params.runId, "sweep", ctx, signal, async (selected) => {
 				switch (params.action) {
 					case "start": return await selected.workflow.start();
 					case "resume": return await selected.workflow.resume();
 					case "show": return await selected.workflow.show(params.guard, params.id);
 					case "record": return await selected.workflow.record(params.guard, params.ledger, params.ownedPaths);
+					case "commit": return await selected.workflow.commit(params.guard, params.message);
 					case "publish": return await selected.workflow.publish(params.guard);
 					case "refresh": return await selected.workflow.refresh(params.guard);
 					case "resolve": return await selected.workflow.resolve(params.guard);
@@ -534,9 +561,10 @@ export default function pullRequestExtension(
 		name: "pi_pr_fix_ci",
 		label: "Fix PR CI",
 		description: "Run one guarded action for the /pr failed-CI route.",
-		parameters: FixCiParameters,
+		parameters: flatRoot(FixCiActions),
 		executionMode: "sequential",
-		async execute(_toolCallId, params, signal, _onUpdate, ctx) {
+		async execute(_toolCallId, raw, signal, _onUpdate, ctx) {
+			const params = checkedAction(FixCiActions, raw);
 			return executeWorkflowAction(params.runId, "fix-ci", ctx, signal, async (selected) => {
 				switch (params.action) {
 					case "collect": return await selected.workflow.collect();
@@ -620,16 +648,13 @@ export default function pullRequestExtension(
 		}
 		const display = projectPrDisplay(discovery);
 		const footer = formatPrFooter(display, ctx.ui.theme);
-		if ((discovery.kind === "current" || discovery.kind === "blocked") && footer === undefined) {
-			throw new Error("Pull request display is missing a footer");
-		}
 		displayedWidget = display.widget === undefined ? undefined : display;
 		ctx.ui.setStatus(UI_KEY, footer);
 		reconcileWidget(ctx);
 		if (discovery.kind === "blocked") {
-			const key = discoveryIssueKey(discovery.issue);
+			const { key, message } = discoveryIssueDetails(discovery.issue);
 			if (lastBlockedIssueKey !== key) {
-				ctx.ui.notify(discoveryIssueMessage(discovery.issue), "warning");
+				ctx.ui.notify(message, "warning");
 				lastBlockedIssueKey = key;
 			}
 		} else {
@@ -670,25 +695,15 @@ export default function pullRequestExtension(
 		const category = error instanceof GitHubRateLimitError ? "quota" : "generic";
 		if (!ctx || reportedRefreshFailure === category || reportedRefreshFailure === "quota") return;
 		reportedRefreshFailure = category;
-		try {
-			ctx.ui.notify(
-				error instanceof GitHubRateLimitError
-					? error.message
-					: "PR status refresh failed: status unavailable",
-				"error",
-			);
-		} catch {
-			console.error("PR status refresh failed and could not be reported");
-		}
+		ctx.ui.notify(
+			error instanceof GitHubRateLimitError ? error.message : "PR status refresh failed: status unavailable",
+			"error",
+		);
 	};
 
 	const reportHerdrRenameFailure = (ctx: ExtensionContext, error: unknown): void => {
-		try {
-			const message = error instanceof Error ? error.message : String(error);
-			ctx.ui.notify(`Herdr workspace rename failed: ${message.slice(0, 500)}`, "warning");
-		} catch (reportError) {
-			console.error("Herdr workspace rename failed and could not be reported", error, reportError);
-		}
+		const message = error instanceof Error ? error.message : String(error);
+		ctx.ui.notify(`Herdr workspace rename failed: ${message.slice(0, 500)}`, "warning");
 	};
 
 	const refresh = async (): Promise<void> => {
@@ -781,7 +796,8 @@ export default function pullRequestExtension(
 
 	pi.on("agent_before_settle", async (event, ctx) => {
 		const selected = workflowContext;
-		if (event.outcome !== "completed" || !event.context.canContinue || !selected?.completed ||
+		// Pi evaluates continuation again after this handler queues the next workflow.
+		if (event.outcome !== "completed" || !selected?.completed ||
 			selected.queuedPrompt || selected.sessionGeneration !== sessionGeneration) return;
 		const invocation = [...activeInvocations].find(([, phase]) => phase === "workflow" || phase === "create-workflow")?.[0];
 		if (invocation === undefined) return;

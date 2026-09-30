@@ -17,9 +17,9 @@ import { RoleLaunchRuntime, type LaunchRuntimeOptions } from "../dist/launch-run
 import { IsolatedRunner, type OperationContext, type RunResponse } from "../dist/runner.js";
 import {
 	IdOnlySchema,
-	ResumeRequestSchema,
+	ResumeRequestParameters,
 	StageRequestSchema,
-	IntegrationActionSchema,
+	IntegrationActionParameters,
 	parseIntegrationAction,
 	parseStageRequest,
 	parseExecuteRequest,
@@ -76,8 +76,7 @@ export const createIsolatedComponents: CreateIsolatedComponents = ({
 		context,
 		resolveRoot,
 		preflightHost: async ({ root }, operation) => await host.preflightHost({ root }, operation),
-		inspectMain: async (input, operation) => await git.inspectMain(input, operation),
-		executionBudget,
+		inspectMainBase: async (input, operation) => await git.inspectMainBase(input, operation),
 	});
 	return {
 		resolveRoot,
@@ -117,10 +116,10 @@ export function workspaceWidgetLines(state: RunState): string[] | undefined {
 	const rows = state.tasks.flatMap((taskState) => {
 		const task = state.request.tasks.find((candidate) => candidate.id === taskState.taskId);
 		if (!task) return [];
-		const status = state.status === "aborted" ? "aborted" : workspaceStatus(taskState.status);
+		const status = workspaceStatus(taskState.status);
 		if (taskState.kind === "text") {
 			return taskState.status === "running" || taskState.status === "needs_attention"
-				? [`${status === "attention" ? "!" : status === "aborted" ? "■" : "◌"} I ${workspaceBadge(task.role, task.modelClass)} ${compactWidgetField(task.id)} · ${status === "attention" ? `attention · ${compactWidgetField(taskState.failure ?? status)}` : status}`]
+				? [`${status === "attention" ? "!" : "◌"} I ${workspaceBadge(task.role, task.modelClass)} ${compactWidgetField(task.id)} · ${status === "attention" ? `attention · ${compactWidgetField(taskState.failure ?? status)}` : status}`]
 				: [];
 		}
 		const attempt = taskState.attempts.at(-1);
@@ -136,17 +135,17 @@ export function workspaceWidgetLines(state: RunState): string[] | undefined {
 			: status === "attention" ? `attention · ${compactWidgetField(taskState.failure ?? "needs attention")}` : status;
 		return `${symbol} I ${workspaceBadge(task.role, task.modelClass)} ${compactWidgetField(task.id)} · ${detail}${allocation ? ` · ${compactWidgetField(allocation.label)}` : ""}`;
 	});
-	return rows.length ? rows : undefined;
+	if (!rows.length) return undefined;
+	return state.status === "aborted"
+		? [`■ I ${compactWidgetField(state.request.id)} · request aborted`, ...rows]
+		: rows;
 }
 
-function updateWorkspaceWidget(ctx: ExtensionContext, state: RunState, rowsByRequest: Map<string, string[]>): void {
-	const key = `${state.root}\0${state.request.id}`;
-	const rows = workspaceWidgetLines(state);
-	if (rows) rowsByRequest.set(key, rows);
-	else rowsByRequest.delete(key);
+function renderWorkspaceWidget(ctx: ExtensionContext, rowsByRequest: Map<string, string[]>): void {
 	if (!ctx.hasUI) return;
-	const allRows = [...rowsByRequest.values()].flat().sort((a, b) =>
-		(a.startsWith("!") ? 0 : a.startsWith("◌") ? 1 : 2) - (b.startsWith("!") ? 0 : b.startsWith("◌") ? 1 : 2));
+	const rowOrder = (row: string) => row.startsWith("!") ? 0 : row.startsWith("◌") ? 1
+		: row.endsWith(" · request aborted") ? 2 : 3;
+	const allRows = [...rowsByRequest.values()].flat().sort((a, b) => rowOrder(a) - rowOrder(b));
 	const shown = allRows.length > MAX_WORKSPACE_WIDGET_LINES
 		? [...allRows.slice(0, MAX_WORKSPACE_WIDGET_LINES - 1), `+${allRows.length - MAX_WORKSPACE_WIDGET_LINES + 1} more · /subagent`]
 		: allRows;
@@ -164,7 +163,11 @@ function updateWorkspaceWidget(ctx: ExtensionContext, state: RunState, rowsByReq
 
 function updateWorkspaceWidgetSafely(ctx: ExtensionContext, state: RunState, rowsByRequest: Map<string, string[]>): void {
 	try {
-		updateWorkspaceWidget(ctx, state, rowsByRequest);
+		const key = `${state.root}\0${state.request.id}`;
+		const rows = workspaceWidgetLines(state);
+		if (rows) rowsByRequest.set(key, rows);
+		else rowsByRequest.delete(key);
+		renderWorkspaceWidget(ctx, rowsByRequest);
 	} catch (error) {
 		console.error("Pi Subagent workspace widget update failed.", error);
 	}
@@ -400,7 +403,7 @@ function toolResult(response: RunResponse, ctx: ExtensionContext, rowsByRequest:
 
 export interface IsolatedSurface {
 	execute(params: unknown, signal: AbortSignal | undefined, ctx: ExtensionContext): Promise<ReturnType<typeof toolResult>>;
-	inventory(cwd: string): Promise<IsolatedInventory>;
+	inventory(cwd: string, current?: () => boolean): Promise<IsolatedInventory>;
 	recover(cwd: string): Promise<string>;
 	inspect(root: string, requestId: string): Promise<readonly string[]>;
 	canFollowup(root: string, requestId: string, taskId: string): boolean;
@@ -425,6 +428,7 @@ export function registerIsolatedExtension(pi: ExtensionAPI, options: RegisterIso
 	let latestCtx: ExtensionContext | undefined;
 	let components: IsolatedExtensionComponents | undefined;
 	const workspaceRowsByRequest = new Map<string, string[]>();
+	let savedRevision = 0;
 	const stateListeners = new Set<(state: RunState) => void>();
 	const activeJobs = new Set<AbortController>();
 	const jobOwners = new Map<string, () => boolean>();
@@ -442,6 +446,7 @@ export function registerIsolatedExtension(pi: ExtensionAPI, options: RegisterIso
 		policy: options.policy,
 		currentPolicy: options.currentPolicy,
 		onStateSaved: (state) => {
+			savedRevision += 1;
 			for (const listener of stateListeners) listener(state);
 			const owner = jobOwners.get(`${state.root}\0${state.request.id}`);
 			if (!sessionClosed && (owner === undefined || owner())) {
@@ -501,6 +506,7 @@ export function registerIsolatedExtension(pi: ExtensionAPI, options: RegisterIso
 		activeJobs.add(controller);
 		jobOwners.set(key, canDeliver);
 		const notified = new Set<string>();
+		const attentionNotified = new Set<string>();
 		let candidateListener: ((state: RunState) => void) | undefined;
 		const finish = () => {
 			activeJobs.delete(controller);
@@ -548,6 +554,15 @@ export function registerIsolatedExtension(pi: ExtensionAPI, options: RegisterIso
 		candidateListener = (state) => {
 			if (state.root !== root || state.request.id !== id || state.status !== "running" || !canDeliver()) return;
 			latestState = state;
+			for (const task of state.tasks) {
+				if (task.status !== "needs_attention") {
+					attentionNotified.delete(task.taskId);
+					continue;
+				}
+				if (attentionNotified.has(task.taskId)) continue;
+				attentionNotified.add(task.taskId);
+				deliver(`Pi Subagent ${id}: ${task.taskId} needs attention. Inspect subagent_status for the saved worker evidence; do not replay an uncertain prompt.`);
+			}
 			for (const candidate of state.integration.candidates) {
 				const identity = `${candidate.taskId}\0${candidate.attempt}\0${candidate.tip.head}`;
 				if (candidate.decision || notified.has(identity)) continue;
@@ -599,7 +614,7 @@ export function registerIsolatedExtension(pi: ExtensionAPI, options: RegisterIso
 		name: "subagent_resume",
 		label: "Subagent resume",
 		description: "Resume one unfinished isolated request without resetting its recorded policy or correction count.",
-		parameters: ResumeRequestSchema,
+		parameters: ResumeRequestParameters,
 		prepareArguments: parseResumeRequest,
 		async execute(_toolCallId, params, signal, _onUpdate, ctx) {
 			latestCtx = ctx;
@@ -626,7 +641,7 @@ export function registerIsolatedExtension(pi: ExtensionAPI, options: RegisterIso
 		name: "subagent_integrate",
 		label: "Subagent integrate",
 		description: "Main advances staged dependents, refreshes after clean Main drift, validates, corrects, promotes, reconciles an interrupted promotion, cleans up promoted resources, or explicitly releases rejected/superseded owned resources. Never replays an uncertain mutation.",
-		parameters: IntegrationActionSchema,
+		parameters: IntegrationActionParameters,
 		prepareArguments: parseIntegrationAction,
 		async execute(_toolCallId, params, signal, _onUpdate, ctx) {
 			latestCtx = ctx;
@@ -643,7 +658,7 @@ export function registerIsolatedExtension(pi: ExtensionAPI, options: RegisterIso
 	pi.registerTool({
 		name: "subagent_abort",
 		label: "Subagent abort",
-		description: "Abort one unfinished isolated request; retained candidates and integration checkouts must be explicitly rejected and released first. Terminate only exact owned workers.",
+		description: "Abort an isolated request; reject and release retained candidates and integration checkouts first. Terminate only exact owned workers. Repeat abort to reconcile cleanup of unchanged no-candidate allocations; preserve dirty or committed work.",
 		parameters: IdOnlySchema,
 		prepareArguments: parseIdOnly,
 		async execute(_toolCallId, params, signal, _onUpdate, ctx) {
@@ -653,9 +668,20 @@ export function registerIsolatedExtension(pi: ExtensionAPI, options: RegisterIso
 		},
 	});
 	return {
-		async inventory(cwd) {
+		async inventory(cwd, current) {
 			const root = await lookupRoot(cwd);
-			return { root, ...await getComponents().runner.listRequests(root) };
+			const revision = savedRevision;
+			const { requests, invalidIds, states } = await getComponents().runner.listRequests(root);
+			if (current?.() && !sessionClosed && revision === savedRevision) {
+				workspaceRowsByRequest.clear();
+				for (const state of states) {
+					const rows = workspaceWidgetLines(state);
+					if (rows) workspaceRowsByRequest.set(`${state.root}\0${state.request.id}`, rows);
+				}
+				try { renderWorkspaceWidget(latestContext(), workspaceRowsByRequest); }
+				catch (error) { console.error("Pi Subagent workspace widget update failed.", error); }
+			}
+			return { root, requests, invalidIds };
 		},
 		async recover(cwd) {
 			const root = await lookupRoot(cwd);

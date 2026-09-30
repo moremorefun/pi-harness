@@ -23,7 +23,6 @@ type Loader = (
 	context: PullRequestLoadContext,
 	inspectedLocal?: unknown,
 	observation?: unknown,
-	explicitCreationBase?: string,
 ) => Promise<CurrentPullRequest | CurrentPullRequestDiscovery | null>;
 type EventHandler = (event: unknown, context: ExtensionContext) => Promise<void> | void;
 type Command = Parameters<ExtensionAPI["registerCommand"]>[1];
@@ -208,8 +207,8 @@ function harness(options: {
 	};
 
 	const extensionDependencies: ExtensionDependencies = {
-		loadCurrentPullRequest: async (pi, context, inspectedLocal, observation, explicitCreationBase) => {
-			const loaded = await options.load(pi, context, inspectedLocal, observation, explicitCreationBase);
+		loadCurrentPullRequest: async (pi, context, inspectedLocal, observation) => {
+			const loaded = await options.load(pi, context, inspectedLocal, observation);
 			if (loaded && "kind" in loaded) return loaded;
 			if (loaded) return { kind: "current", pullRequest: loaded };
 			return noPullRequest();
@@ -306,7 +305,7 @@ function harness(options: {
 			await handler(beforeAgentStart, "before_agent_start")({ prompt } as never, callbackContext(ctx));
 		},
 		async beforeSettle(ctx: ExtensionContext, outcome = "completed"): Promise<void> {
-			await handler(agentBeforeSettle, "agent_before_settle")({ outcome, context: { canContinue: true } } as never, callbackContext(ctx));
+			await handler(agentBeforeSettle, "agent_before_settle")({ outcome, context: { canContinue: false } } as never, callbackContext(ctx));
 		},
 		async settle(ctx: ExtensionContext): Promise<void> {
 			await handler(agentSettled, "agent_settled")({} as never, callbackContext(ctx));
@@ -340,39 +339,47 @@ function harness(options: {
 	};
 }
 
-test("registers sequential tools with closed action schemas", () => {
+test("registers sequential tools with flat object roots and strict actions", async () => {
 	const app = harness({ async load() { return { kind: "inactive" }; } });
 	const expected = new Map([
 		["pi_pr_update_branch", ["rebase", "continue", "publish"]],
 		["pi_pr_create", ["prepare", "inspect", "commit", "verify", "push", "publish"]],
 		["pi_pr_publish_work", ["inspect", "commit", "validate", "publish"]],
-		["pi_pr_sweep", ["start", "resume", "show", "record", "publish", "refresh", "resolve", "finalize"]],
+		["pi_pr_sweep", ["start", "resume", "show", "record", "commit", "publish", "refresh", "resolve", "finalize"]],
 		["pi_pr_fix_ci", ["collect", "publish"]],
 	]);
 
 	assert.deepEqual(app.tools.map(({ name }) => name), [...expected.keys()]);
 	for (const tool of app.tools) {
 		assert.equal(tool.executionMode, "sequential", tool.name);
-		const alternatives = (tool.parameters as unknown as {
-			anyOf: Array<{ additionalProperties?: boolean; properties: { action: { const: string } }; required?: string[] }>;
-		}).anyOf;
-		assert.deepEqual(alternatives.map(({ properties }) => properties.action.const), expected.get(tool.name), tool.name);
-		assert.ok(alternatives.every(({ additionalProperties }) => additionalProperties === false), tool.name);
+		// Strict OpenAI-compatible endpoints reject a root without type "object"; Claude Code drops a root union.
+		const schema = tool.parameters as unknown as {
+			type?: string;
+			anyOf?: unknown;
+			additionalProperties?: boolean;
+			required?: string[];
+			properties: { action: { anyOf: Array<{ const: string }> } };
+		};
+		assert.equal(schema.type, "object", tool.name);
+		assert.equal(schema.anyOf, undefined, tool.name);
+		assert.equal(schema.additionalProperties, false, tool.name);
+		assert.deepEqual(schema.required, ["runId", "action"], tool.name);
+		assert.deepEqual(schema.properties.action.anyOf.map(({ const: value }) => value), expected.get(tool.name), tool.name);
 	}
-	const sweepAlternatives = (app.tools.find(({ name }) => name === "pi_pr_sweep")!.parameters as unknown as {
-		anyOf: Array<{ properties: Record<string, unknown> & { action: { const: string } }; required?: string[] }>;
-	}).anyOf;
-	const record = sweepAlternatives.find(({ properties }) => properties.action.const === "record")!;
-	const refresh = sweepAlternatives.find(({ properties }) => properties.action.const === "refresh")!;
-	assert.ok(!record.required?.includes("ownedPaths"));
-	assert.deepEqual(Object.keys(refresh.properties).sort(), ["action", "guard", "runId"]);
-	const resolve = sweepAlternatives.find(({ properties }) => properties.action.const === "resolve")!;
-	const finalize = sweepAlternatives.find(({ properties }) => properties.action.const === "finalize")!;
-	assert.deepEqual(Object.keys(resolve.properties).sort(), ["action", "guard", "runId"]);
-	assert.deepEqual(Object.keys(finalize.properties).sort(), ["action", "checks", "guard", "runId"]);
+	// Flat parameters cannot express action-dependent requirements; reject invalid combinations at execution.
+	const ctx = app.context();
+	const guard = { epoch: 1, runId: "run", generation: 1, fingerprint: "a".repeat(64) };
+	for (const [name, args] of [
+		["pi_pr_sweep", { runId: routeRunId, action: "refresh", guard, checks: [] }],
+		["pi_pr_create", { runId: routeRunId, action: "commit", ownedPaths: [] }],
+		["pi_pr_update_branch", { runId: routeRunId, action: "rebase", extra: true }],
+		["pi_pr_fix_ci", { runId: routeRunId, action: "unknown" }],
+	] as const) {
+		await assert.rejects(app.callTool(name, args, ctx), /do not match one action/, name);
+	}
 });
 
-test("one /pr continues after create, conflict rebase, CI repair and feedback without approval until external CI", async () => {
+test("one /pr continues from a final answer through queued workflows without before_agent_start until external CI", async () => {
 	let stage = 0;
 	let run = 0;
 	const ids = [1, 2, 3, 4].map((n) => `${String(n).repeat(8)}-1111-4111-8111-111111111111`);
@@ -386,6 +393,7 @@ test("one /pr continues after create, conflict rebase, CI repair and feedback wi
 			return pr;
 		},
 		useDefaultCommandHandler: true,
+		isIdle: () => stage === 0,
 		newRunId: () => ids[run++]!,
 		async canonicalWorktree() { return "/canonical/repo"; },
 		createPullRequestCreator() { return {
@@ -409,9 +417,13 @@ test("one /pr continues after create, conflict rebase, CI repair and feedback wi
 	try {
 		await app.start(ctx);
 		await app.command().handler("", ctx as ExtensionCommandContext);
-		for (const [tool, action] of [["pi_pr_create", "publish"], ["pi_pr_update_branch", "publish"],
-			["pi_pr_fix_ci", "publish"], ["pi_pr_sweep", "finalize"]] as const) {
-			await app.callTool(tool, { runId: ids[stage], action, title: "fix", body: "Summary", guard: {}, projection: {}, checks: [] }, ctx);
+		for (const [tool, args] of [
+			["pi_pr_create", { action: "publish", title: "fix", body: "Summary" }],
+			["pi_pr_update_branch", { action: "publish" }],
+			["pi_pr_fix_ci", { action: "publish" }],
+			["pi_pr_sweep", { action: "finalize", guard: { epoch: 1, runId: "run", generation: 1, fingerprint: "a".repeat(64) }, checks: [] }],
+		] as const) {
+			await app.callTool(tool, { runId: ids[stage], ...args }, ctx);
 			await app.beforeSettle(ctx);
 		}
 		assert.equal(stage, 4);
@@ -434,6 +446,8 @@ test("a completed helper does not repeat its route when fresh evidence is unchan
 		await app.start(ctx);
 		await app.command().handler("", ctx as ExtensionCommandContext);
 		await app.callTool("pi_pr_fix_ci", { runId: routeRunId, action: "publish" }, ctx);
+		for (const outcome of ["aborted", "error"]) await app.beforeSettle(ctx, outcome);
+		assert.equal(app.notifications.length, 0, "unsuccessful outcomes must not rediscover or continue");
 		await app.beforeSettle(ctx);
 		assert.equal(app.messages.length, 1);
 		assert.match(app.notifications.at(-1)!.message, /already ran/);
@@ -917,10 +931,8 @@ test("routes create, sweep, and CI tool actions directly to their bound helpers"
 			fetchTracking: "none", setUpstream: "none", pullRequest: "none",
 		},
 	};
-	const receivedBases: Array<string | undefined> = [];
 	const create = harness({
-		async load(_pi, _context, _inspectedLocal, _observation, explicitCreationBase) {
-			receivedBases.push(explicitCreationBase);
+		async load() {
 			return noPullRequest(1);
 		},
 		useDefaultCommandHandler: true,
@@ -944,7 +956,6 @@ test("routes create, sweep, and CI tool actions directly to their bound helpers"
 		await create.command().handler("", createContext as ExtensionCommandContext);
 		await create.callTool("pi_pr_create", { runId: routeRunId, action: "prepare" }, createContext);
 		assert.deepEqual(createCalls, [["prepare", undefined]]);
-		assert.deepEqual(receivedBases, [undefined, undefined]);
 		assert.deepEqual(create.messages, [`/skill:pi-pr-create runId=${routeRunId} action=prepare`]);
 	} finally {
 		await create.shutdown(createContext);
@@ -998,7 +1009,7 @@ test("routes create, sweep, and CI tool actions directly to their bound helpers"
 	}
 });
 
-test("feedback record, resolution, and finalization require no UI confirmation", async () => {
+test("feedback record, commit, resolution, and finalization require no UI confirmation", async () => {
 	const calls: string[] = [];
 	const guard = { epoch: 1, runId: "sweep", generation: 1, fingerprint: "a".repeat(64) };
 	const app = harness({
@@ -1009,6 +1020,12 @@ test("feedback record, resolution, and finalization require no UI confirmation",
 		createCommentSweep() { return {
 			async recoveryLaunchAction() { return "start" as const; },
 			async record() { calls.push("record"); return { phase: "recorded", guard }; },
+			async commit(receivedGuard: unknown, message: string) {
+				assert.deepEqual(receivedGuard, guard);
+				assert.equal(message, "fix: address review");
+				calls.push("commit");
+				return { head: "b".repeat(40) };
+			},
 			async resolve() { calls.push("resolve"); return { phase: "resolved", guard }; },
 			async finalize() { calls.push("finalize"); return { kind: "finalized", head: "a".repeat(40) }; },
 		} as never; },
@@ -1018,13 +1035,14 @@ test("feedback record, resolution, and finalization require no UI confirmation",
 	try {
 		await app.start(ctx);
 		await app.command().handler("", ctx as ExtensionCommandContext);
-		for (const action of ["record", "resolve", "finalize"] as const) {
+		for (const action of ["record", "commit", "resolve", "finalize"] as const) {
 			await app.callTool("pi_pr_sweep", { runId: routeRunId, action, guard,
 				...(action === "record" ? { ledger: [], ownedPaths: [] } : {}),
+				...(action === "commit" ? { message: "fix: address review" } : {}),
 				...(action === "finalize" ? { checks: [] } : {}),
 			}, ctx);
 		}
-		assert.deepEqual(calls, ["record", "resolve", "finalize"]);
+		assert.deepEqual(calls, ["record", "commit", "resolve", "finalize"]);
 	} finally { await app.shutdown(ctx); }
 });
 
@@ -1355,7 +1373,10 @@ test("warns once for one blocked issue and warns again after recovery", async ()
 	};
 	const results: Array<CurrentPullRequestDiscovery | CurrentPullRequest> = [
 		blocked,
-		blocked,
+		{ kind: "blocked", issue: { kind: "candidate-prs-ambiguous", urls: [
+			new URL("https://github.com/acme/project/pull/42"),
+			new URL("https://github.com/acme/project/pull/43"),
+		] } },
 		currentPullRequest(),
 		blocked,
 	];

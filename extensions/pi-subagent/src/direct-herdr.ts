@@ -38,7 +38,7 @@ export interface DirectHandle {
 	cancel(): Promise<void>;
 }
 
-export function exactDirectAnswer(jsonl: string, prompt: string, maxBytes = ANSWER_LIMIT): string {
+function exactFinalTurn(jsonl: string, prompt: string): Json | undefined {
 	const lines = jsonl.trimEnd().split("\n");
 	let userId: string | undefined;
 	let final: Json | undefined;
@@ -68,7 +68,17 @@ export function exactDirectAnswer(jsonl: string, prompt: string, maxBytes = ANSW
 		seen.add(ancestor);
 		ancestor = parents.get(ancestor);
 	}
-	if (!userId || ancestor !== userId || !final || final.stopReason !== "stop" || !Array.isArray(final.content)) {
+	return userId && ancestor === userId ? final : undefined;
+}
+
+export function exactDirectTerminalTurn(jsonl: string, prompt: string): boolean {
+	const reason = exactFinalTurn(jsonl, prompt)?.stopReason;
+	return reason === "stop" || reason === "error" || reason === "aborted";
+}
+
+export function exactDirectAnswer(jsonl: string, prompt: string, maxBytes = ANSWER_LIMIT): string {
+	const final = exactFinalTurn(jsonl, prompt);
+	if (!final || final.stopReason !== "stop" || !Array.isArray(final.content)) {
 		throw new Error("Pi did not persist an exact successful final answer for this prompt.");
 	}
 	const text = final.content.flatMap((part) => {

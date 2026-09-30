@@ -79,6 +79,16 @@ export const ResumeRequestSchema = Type.Union([
 	Type.Object({ id: IdSchema, action: Type.Literal("verify"), taskId: IdSchema }, { additionalProperties: false }),
 	Type.Object({ id: IdSchema, action: Type.Literal("finalize") }, { additionalProperties: false }),
 ]);
+// Tool parameters need a plain object root; the action union remains the validation boundary.
+export const ResumeRequestParameters = Type.Object({
+	id: IdSchema,
+	action: Type.Union([
+		ResumeRequestSchema.anyOf[0].properties.action,
+		ResumeRequestSchema.anyOf[1].properties.action,
+		ResumeRequestSchema.anyOf[2].properties.action,
+	]),
+	taskId: Type.Optional(IdSchema),
+}, { additionalProperties: false });
 
 export type IdOnly = Static<typeof IdOnlySchema>;
 export type CheckCommand = Static<typeof CheckCommandSchema>;
@@ -91,14 +101,7 @@ export type ExecuteRequest = Omit<ExecuteRequestInput, "finalChecks"> & {
 	finalChecks: CheckCommand[];
 };
 
-export interface ExecutionPolicySnapshot {
-	maxSubagents: number;
-	maxTurns: number;
-	maxTokens?: number;
-	childIdleMs: number;
-	childMaxMs: number;
-	maxCorrections: number;
-}
+export type ExecutionPolicySnapshot = Static<typeof ExecutionPolicySnapshotSchema>;
 export type ResumeRequest = Static<typeof ResumeRequestSchema>;
 
 export type WorkspaceIdentity = Static<typeof WorkspaceSchema>;
@@ -244,6 +247,20 @@ export const IntegrationActionSchema = Type.Union([
 		attempt: Type.Optional(Type.Integer({ minimum: 1, maximum: 2 })),
 	}, { additionalProperties: false }),
 ]);
+export const IntegrationActionParameters = Type.Object({
+	id: IntegrationActionSchema.anyOf[0].properties.id,
+	generation: IntegrationActionSchema.anyOf[0].properties.generation,
+	action: Type.Union([
+		IntegrationActionSchema.anyOf[0].properties.action,
+		IntegrationActionSchema.anyOf[1].properties.action,
+		IntegrationActionSchema.anyOf[2].properties.action,
+	]),
+	expectedTip: IntegrationActionSchema.anyOf[0].properties.expectedTip,
+	expectedMain: Type.Optional(IntegrationActionSchema.anyOf[0].properties.expectedMain),
+	newMain: Type.Optional(IntegrationActionSchema.anyOf[0].properties.newMain),
+	taskId: IntegrationActionSchema.anyOf[2].properties.taskId,
+	attempt: IntegrationActionSchema.anyOf[2].properties.attempt,
+}, { additionalProperties: false });
 export type IntegrationAction = Static<typeof IntegrationActionSchema>;
 export function parseIntegrationAction(value: unknown): IntegrationAction {
 	if (!Check(IntegrationActionSchema, value)) throw schemaValidationError("subagent_integrate requires an exact generation and tip", Errors(IntegrationActionSchema, value));
@@ -777,10 +794,10 @@ function validateTextTaskState(taskState: TextTaskState): void {
 		? taskState.attempts.length ? "superseded" : undefined
 		: taskState.status === "running"
 			? "running"
-			: taskState.status === "completed"
-				? "completed"
-				: "failed";
-	if (latest?.status !== expectedLatestStatus) {
+			: "completed";
+	if (taskState.status === "needs_attention"
+		? latest && !["failed", "superseded"].includes(latest.status)
+		: latest?.status !== expectedLatestStatus) {
 		throw new Error(`Text task ${taskState.taskId} status ${taskState.status} has an incompatible latest attempt.`);
 	}
 	if ((taskState.failure !== undefined) !== (taskState.status === "needs_attention")) {
@@ -789,8 +806,8 @@ function validateTextTaskState(taskState: TextTaskState): void {
 	if (taskState.failure !== undefined) {
 		requireRuntimeTextByteLength(taskState.failure, `Text task ${taskState.taskId} failure`);
 	}
-	if (taskState.status === "needs_attention" && latest?.failure !== taskState.failure) {
-		throw new Error(`Text task ${taskState.taskId} needs-attention failure must exactly match its latest attempt failure.`);
+	if (taskState.status === "needs_attention" && latest?.status === "failed" && latest.failure === undefined) {
+		throw new Error(`Text task ${taskState.taskId} lacks its latest execution failure.`);
 	}
 }
 

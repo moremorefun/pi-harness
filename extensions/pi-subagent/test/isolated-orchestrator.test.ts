@@ -18,9 +18,9 @@ import type { OperationContext, RunResponse } from "../src/runner.ts";
 import {
 	ExecuteRequestSchema,
 	IdOnlySchema,
-	ResumeRequestSchema,
+	ResumeRequestParameters,
 	StageRequestSchema,
-	IntegrationActionSchema,
+	IntegrationActionParameters,
 	parseIntegrationAction,
 	parseStageRequest,
 	parseExecuteRequest,
@@ -195,6 +195,7 @@ function createHarness(options: {
 	runner?: IsolatedExtensionComponents["runner"];
 	resolveRoot?: IsolatedExtensionComponents["resolveRoot"];
 	responseState?: RunState;
+	inventoryStates?: RunState[];
 	onCreate?: (options: Parameters<CreateIsolatedComponents>[0]) => void;
 } = {}): Harness {
 	const tools: RegisteredTool[] = [];
@@ -260,7 +261,7 @@ function createHarness(options: {
 		},
 		listRequests(...args: unknown[]) {
 			runnerCalls.push({ method: "listRequests", args });
-			return { requests: [{ id: "request-one", name: "Goal", status: "working", tasks: [{ id: "unit-one", name: "Task", kind: "changeset", status: "working" }] }], invalidIds: ["damaged"] };
+			return { requests: [{ id: "request-one", name: "Goal", status: "working", tasks: [{ id: "unit-one", name: "Task", kind: "changeset", status: "working" }] }], invalidIds: ["damaged"], states: options.inventoryStates ?? [] };
 		},
 		canFollowup(...args: unknown[]) {
 			runnerCalls.push({ method: "canFollowup", args });
@@ -412,8 +413,9 @@ test("workspace widget lists every uncleaned workspace with status and agent con
 	const firstWorkspace = firstTask.attempts[0]!.allocations.find((allocation) => allocation.kind === "workspace")!;
 	firstWorkspace.label = "x".repeat(64);
 	assert.deepEqual(workspaceWidgetLines(state), [
-		`■ I [I1] unit-one · aborted · ${"x".repeat(31)}~`,
-		"■ I [R2] unit-two · aborted · fedcba",
+		"■ I request-one · request aborted",
+		`! I [I1] unit-one · attention · The task needs a deliberate rec~ · ${"x".repeat(31)}~`,
+		"◌ I [R2] unit-two · working · fedcba",
 	]);
 	state.status = "needs_attention";
 	firstTask.status = "ready_to_integrate";
@@ -453,6 +455,36 @@ test("status restores active workspace rows and provides the non-TUI fallback", 
 	assert.equal(rpcResult.content[0]!.text, "bounded status result\n\nActive workspaces:\n! I [I1] unit-one · attention · The task needs a deliberate rec~ · 012345");
 });
 
+test("aborted request keeps mixed task evidence distinct in status and widget", async () => {
+	const state = structuredClone(PRIVATE_STATE);
+	state.status = "aborted";
+	addWorkspace(state);
+	const first = state.tasks[0]!;
+	if (first.kind !== "changeset") throw new Error("Expected a changeset task.");
+	first.failure = "Worker prompt outcome ambiguous";
+	first.attempts[0]!.prompts[0]!.status = "ambiguous";
+	state.request.tasks.push({ ...state.request.tasks[0]!, id: "unit-two", role: "reviewer" });
+	state.tasks.push({ ...structuredClone(first), taskId: "unit-two", status: "working", failure: undefined });
+	const widgets: Array<string[] | undefined> = [];
+	const ctx = { cwd: "/repo", hasUI: true,
+		ui: { setWidget: (_key: string, content: WidgetContent) => widgets.push(renderWidget(content)) } } as unknown as ExtensionContext;
+	const harness = createHarness({ responseState: state });
+	const result = await executeTool(namedTool(harness, "subagent_status"), { id: "request-one" }, undefined, ctx);
+	assert.deepEqual(widgets.at(-1), [
+		"! I [I1] unit-one · attention · Worker prompt outcome ambiguous · 012345",
+		"◌ I [R1] unit-two · working · 012345",
+		"■ I request-one · request aborted",
+	]);
+	const { status, tasks, integration } = (result.details as {
+		state: { status: string; tasks: Array<{ taskId: string; status: string }>; integration: { candidates: unknown[] } };
+	}).state;
+	assert.deepEqual({ status, tasks, candidates: integration.candidates }, {
+		status: "aborted",
+		tasks: [{ taskId: "unit-one", status: "needs_attention" }, { taskId: "unit-two", status: "working" }],
+		candidates: [],
+	});
+});
+
 test("isolated widget colors status glyphs with the active TUI theme while retaining plain status text", async () => {
 	let widget: WidgetContent;
 	const ctx = { cwd: "/repo", hasUI: true,
@@ -480,7 +512,7 @@ test("isolated widget colors status glyphs with the active TUI theme while retai
 	task.status = "completed";
 	assert.match(show(), /^<success>✓<\/success> I \[I1\] unit-one · completed · /);
 	state.status = "aborted";
-	assert.match(show(), /^<warning>■<\/warning> I \[I1\] unit-one · aborted · /);
+	assert.match(show(), /^<warning>■<\/warning> I request-one · request aborted$/);
 });
 
 test("isolated work remains visible before any workspace is allocated", () => {
@@ -496,7 +528,10 @@ test("isolated work remains visible before any workspace is allocated", () => {
 	textTask.failure = "Recover the task";
 	assert.deepEqual(workspaceWidgetLines(state), ["! I [S1] research · attention · Recover the task"]);
 	state.status = "aborted";
-	assert.deepEqual(workspaceWidgetLines(state), ["■ I [S1] research · aborted"]);
+	assert.deepEqual(workspaceWidgetLines(state), [
+		"■ I request-one · request aborted",
+		"! I [S1] research · attention · Recover the task",
+	]);
 });
 
 test("isolated widget caps rows and keeps attention visible", async () => {
@@ -517,6 +552,44 @@ test("isolated widget caps rows and keeps attention visible", async () => {
 	assert.equal(widgets.at(-1)?.length, 6);
 	assert.match(widgets.at(-1)![0]!, /^! I /);
 	assert.equal(widgets.at(-1)![5], "+2 more · /subagent");
+});
+
+test("attention tasks remain visible when aborted summaries exceed the widget cap", async () => {
+	const widgets: Array<string[] | undefined> = [];
+	const ctx = { cwd: "/repo", hasUI: true,
+		ui: { setWidget: (_key: string, content: WidgetContent) => widgets.push(renderWidget(content)) } } as unknown as ExtensionContext;
+	const harness = createHarness();
+	await executeTool(namedTool(harness, "delegate_task"), EXECUTE_REQUEST, undefined, ctx);
+	for (let index = 0; index < 5; index++) {
+		const state = structuredClone(PRIVATE_STATE);
+		state.request.id = `aborted-${index}`;
+		state.status = "aborted";
+		addWorkspace(state);
+		harness.getStateSaved()(state);
+	}
+	assert.match(widgets.at(-1)![0]!, /^! I /);
+	assert.equal(widgets.at(-1)![5], "+5 more · /subagent");
+});
+
+test("inventory refresh restores and clears workspace widget rows from saved state", async () => {
+	const state = structuredClone(PRIVATE_STATE);
+	addWorkspace(state);
+	const states = [state];
+	const widgets: Array<string[] | undefined> = [];
+	const ctx = { cwd: "/repo", hasUI: true,
+		ui: { setWidget: (_key: string, content: WidgetContent) => widgets.push(renderWidget(content)) } } as unknown as ExtensionContext;
+	const harness = createHarness({ inventoryStates: states });
+	harness.handlers.get("session_start")!({}, ctx);
+	assert.equal(widgets.at(-1), undefined);
+	const inventory = await harness.surface.inventory("/repo", () => true);
+	assert.deepEqual(inventory.requests.map(({ id }) => id), ["request-one"]);
+	assert.deepEqual(widgets.at(-1), workspaceWidgetLines(state));
+	states.length = 0;
+	await harness.surface.inventory("/repo", () => true);
+	assert.equal(widgets.at(-1), undefined);
+	states.push(state);
+	await harness.surface.inventory("/repo", () => false);
+	assert.equal(widgets.at(-1), undefined);
 });
 
 test("saved state updates and clears the workspace widget", async () => {
@@ -562,12 +635,12 @@ test("registers six strict tools without constructing runtime components", () =>
 	assert.equal(execute!.prepareArguments, parseExecuteRequest);
 	assert.equal(status!.parameters, IdOnlySchema);
 	assert.equal(status!.prepareArguments, parseIdOnly);
-	assert.equal(resume!.parameters, ResumeRequestSchema);
+	assert.equal(resume!.parameters, ResumeRequestParameters);
 	assert.equal(resume!.prepareArguments, parseResumeRequest);
 	assert.equal(stage!.parameters, StageRequestSchema);
 	assert.equal(stage!.prepareArguments, parseStageRequest);
 	assert.throws(() => stage!.prepareArguments({ id: "request-one", action: "stage", taskId: "unit-one" }), /exact candidate and generation/);
-	assert.equal(integrate!.parameters, IntegrationActionSchema);
+	assert.equal(integrate!.parameters, IntegrationActionParameters);
 	assert.equal(integrate!.prepareArguments, parseIntegrationAction);
 	assert.throws(() => integrate!.prepareArguments({ id: "request-one", action: "promote" }), /exact generation and tip/);
 	assert.equal(abort!.parameters, IdOnlySchema);
@@ -809,6 +882,44 @@ test("a ready worker sends Main a stageable follow-up before the wave finishes",
 	await new Promise(setImmediate);
 });
 
+test("worker attention notifies Main once while a sibling is still running", async () => {
+	const done = deferred<RunResponse>();
+	let save!: (state: RunState) => void;
+	const harness = createHarness({
+		onCreate(options) { save = options.onStateSaved; },
+		runner: { async execute() {
+			const pending = structuredClone(PRIVATE_STATE);
+			pending.status = "pending";
+			pending.updatedAt = pending.createdAt;
+			pending.tasks[0]!.status = "pending";
+			pending.tasks[0]!.attempts = [];
+			save(pending);
+			return await done.promise;
+		} } as never,
+	});
+	const ctx = { ...context(CANONICAL_ROOT), sessionManager: { getSessionId: () => "origin" } } as ExtensionContext;
+	harness.handlers.get("session_start")!({}, ctx);
+	await executeTool(namedTool(harness, "delegate_task"), EXECUTE_REQUEST, undefined, ctx);
+	const state = structuredClone(PRIVATE_STATE);
+	state.status = "running";
+	state.request.tasks.push({ ...state.request.tasks[0]!, id: "unit-two" });
+	const first = state.tasks[0]!;
+	if (first.kind !== "changeset") throw new Error("Expected a changeset task.");
+	state.tasks.push({ ...structuredClone(first), taskId: "unit-two", status: "working", failure: undefined });
+	save(state);
+	save(state);
+	assert.equal(harness.sent.length, 1);
+	assert.match(harness.sent[0]!.message.content, /unit-one needs attention.*subagent_status/);
+	assert.deepEqual(harness.sent[0]!.options, { triggerTurn: true, deliverAs: "followUp" });
+	state.tasks[0]!.status = "working";
+	save(state);
+	state.tasks[0]!.status = "needs_attention";
+	save(state);
+	assert.equal(harness.sent.length, 2);
+	done.resolve(response("execute", true, state));
+	await new Promise(setImmediate);
+});
+
 test("advance acknowledges a dependent wave before its workers finish", async () => {
 	const done = deferred<RunResponse>();
 	let save!: (state: RunState) => void;
@@ -817,6 +928,7 @@ test("advance acknowledges a dependent wave before its workers finish", async ()
 		runner: { async integrate() {
 			const running = structuredClone(PRIVATE_STATE);
 			running.status = "running";
+			running.tasks[0]!.status = "working";
 			running.waves = [{ number: 1, base: RECORDED_MAIN, taskIds: ["unit-one"], status: "dispatching" }];
 			save(running);
 			return await done.promise;

@@ -249,6 +249,7 @@ export interface InFlightTaskCandidateInspector {
 
 export interface GitRuntime {
 	inspectMain(input: { root: string }, context: OperationContext): Promise<WorkspaceIdentity>;
+	inspectMainBase(input: { root: string }, context: OperationContext): Promise<WorkspaceIdentity>;
 	allocateWorktree(input: {
 		root: string;
 		baseRoot?: string;
@@ -328,7 +329,7 @@ interface RuntimeScope {
 class ProductiveScope implements RuntimeScope {
 	readonly signal: AbortSignal;
 
-	constructor(_timeoutMs: number, _now: () => number, outerSignal?: AbortSignal) {
+	constructor(outerSignal?: AbortSignal) {
 		this.signal = outerSignal ?? new AbortController().signal;
 	}
 
@@ -420,11 +421,6 @@ class FollowupControl {
 		if (queued) return queued;
 		this.sealed = true;
 		return undefined;
-	}
-
-	invalidate(): void {
-		this.sealed = true;
-		this.queue.length = 0;
 	}
 
 	close(): void {
@@ -582,9 +578,18 @@ function stagedDependencySnapshot(state: RunState, taskId: string, tip: Workspac
 function textRetryEligible(state: RunState, task: TextTaskState): boolean {
 	const attempt = task.attempts.at(-1);
 	return task.status === "needs_attention"
-		&& attempt?.status === "failed"
+		&& (!attempt || attempt.status === "failed" || attempt.status === "superseded")
 		&& task.attempts.length < 2
 		&& taskDependenciesCompleted(state, task.taskId);
+}
+
+function hasPassingPreliminaryEvidence(request: ChangesetTaskRequest, attempt: TaskAttempt): boolean {
+	return Boolean(attempt.candidate && attempt.candidateBase
+		&& checkBatchPasses(attempt.preliminaryChecks, request.checks, attempt.candidate)
+		&& (!request.judgment || reviewEvidencePasses(attempt.preliminaryReview, "preliminary",
+			request.judgment.criterion, attempt.candidateBase, attempt.candidate))
+		&& !attempt.prompts.some((prompt) => prompt.status === "ambiguous")
+		&& allocationByKind(attempt, "agent")?.agentName && !attempt.termination);
 }
 
 function changesetTaskState(state: RunState, id: string): ChangesetTaskState {
@@ -832,14 +837,14 @@ export class IsolatedRunner {
 		this.currentPolicy = currentPolicy;
 	}
 
-	async listRequests(root: string): Promise<{ requests: Array<{ id: string; name: string; status: string; tasks: Array<{ id: string; name: string; status: string; kind: string }> }>; invalidIds: string[] }> {
-		const { states, invalidIds } = await this.store.list(root);
-		return { invalidIds, requests: states.map(({ state }) => ({
+	async listRequests(root: string): Promise<{ requests: Array<{ id: string; name: string; status: string; tasks: Array<{ id: string; name: string; status: string; kind: string }> }>; invalidIds: string[]; states: RunState[] }> {
+		const { states: entries, invalidIds } = await this.store.list(root);
+		return { invalidIds, states: entries.map(({ state }) => state), requests: entries.map(({ state }) => ({
 			id: state.request.id, name: state.request.goal,
-			status: state.status === "completed" && (state.tasks.some((task) => task.kind === "changeset" && task.attempts.some((attempt) => attempt.cleanup.some((step) => step.status !== "completed")))
+			status: ["completed", "aborted"].includes(state.status) && (state.tasks.some((task) => task.kind === "changeset" && task.attempts.some((attempt) => attempt.cleanup.some((step) => step.status !== "completed")))
 				|| state.integration.generations.some((generation) => generation.cleanup?.some((step) => step.status !== "completed")
 					|| (generation.worktree && generation.cleanup?.every((step) => step.status === "completed") !== true)))
-				? "completed · retained" : state.status,
+				? `${state.status} · retained` : state.status,
 			tasks: state.request.tasks.map((task) => ({
 				id: task.id, name: task.requirements, kind: task.kind,
 				status: state.tasks.find((item) => item.taskId === task.id)!.status,
@@ -857,7 +862,7 @@ export class IsolatedRunner {
 			inventory = await this.withProductiveRun(root, async (lifecycle) => await this.store.withLock(root, async () => {
 				const listed = await this.listRequests(root);
 				for (const request of listed.requests) {
-					if (request.status !== "pending" && request.status !== "running") continue;
+					if (!["pending", "running", "needs_attention"].includes(request.status)) continue;
 					const handle = await this.store.load(root, request.id);
 					if (this.recoverInterrupted(handle.state)) await handle.save();
 				}
@@ -870,7 +875,7 @@ export class IsolatedRunner {
 		}
 		const requests: RunResponse[] = [];
 		for (const request of inventory.requests) {
-			if (["pending", "running", "needs_attention", "completed · retained"].includes(request.status)) {
+			if (["pending", "running", "needs_attention", "completed · retained", "aborted · retained"].includes(request.status)) {
 				requests.push(await this.status(request.id, root));
 			}
 		}
@@ -975,7 +980,7 @@ export class IsolatedRunner {
 	async execute(value: unknown, cwd: string, outerSignal?: AbortSignal): Promise<RunResponse> {
 		const request = parseExecuteRequest(value);
 		const policy = Object.freeze({ ...this.currentPolicy() });
-		const scope = new ProductiveScope(policy.childMaxMs, () => this.coordinatorRuntime.now(), outerSignal);
+		const scope = new ProductiveScope(outerSignal);
 		const canonicalCwd = realpathSync.native(cwd);
 		const prepared = await scope.call(async (context) => await this.coordinatorRuntime.preflight({ request, cwd: canonicalCwd }, context));
 		const root = realpathSync.native(prepared.root);
@@ -1057,8 +1062,7 @@ export class IsolatedRunner {
 				return loaded;
 			}, { productiveRunLease: lifecycle.lease });
 			const state = handle.state;
-			const current = this.currentPolicy();
-			const scope: RuntimeScope = new ProductiveScope(Math.min(state.policy.childMaxMs, current.childMaxMs), () => this.coordinatorRuntime.now(), outerSignal);
+			const scope: RuntimeScope = new ProductiveScope(outerSignal);
 			try {
 				if (request.action === "finalize") return await this.finalize(handle, scope);
 				const task = taskState(state, request.taskId);
@@ -1067,8 +1071,8 @@ export class IsolatedRunner {
 					if (request.action === "verify") throw new Error(`Text task ${task.taskId} cannot be verified.`);
 					if (!textRetryEligible(state, task)) {
 						const attempt = task.attempts.at(-1);
-						if (attempt?.status !== "failed" || task.attempts.length >= 2) {
-							throw new Error(`Text task ${task.taskId} retry requires a failed latest attempt and fewer than two attempts.`);
+						if ((attempt && !["failed", "superseded"].includes(attempt.status)) || task.attempts.length >= 2) {
+							throw new Error(`Text task ${task.taskId} retry requires an unstarted, failed or superseded dispatch and fewer than two attempts.`);
 						}
 						throw new Error(`Text task ${task.taskId} dependencies are not completed.`);
 					}
@@ -1083,7 +1087,6 @@ export class IsolatedRunner {
 				if (error instanceof DurableRunStopped) return this.response(handle.state);
 				throw error;
 			} finally {
-				if (scope instanceof DeadlineScope) scope.close();
 				this.closeRequestControls(root, request.id);
 				if (!lifecycle.stopped) {
 					delete state.recovery;
@@ -1120,8 +1123,7 @@ export class IsolatedRunner {
 				const expected = generation && generation.status !== "superseded"
 					? generation.combinedTip ?? generation.stages.at(-1)?.tip ?? generation.integrationBase : state.main;
 				if (!sameIdentity(action.expectedTip, expected)) throw new Error("Rejection recovery has a stale integration tip.");
-				const scope = new ProductiveScope(Math.min(state.policy.childMaxMs, this.currentPolicy().childMaxMs),
-					() => this.coordinatorRuntime.now(), outerSignal);
+				const scope = new ProductiveScope(outerSignal);
 				const termination = attempt.termination;
 				const result = await scope.call((context) => this.hostRuntime.reconcileWorkerTermination({
 					task: changesetTaskRequest(state, task.taskId), attempt, workerId: termination.workerId,
@@ -1140,8 +1142,7 @@ export class IsolatedRunner {
 				|| !sameIdentity(attempt!.readiness!.candidate, action.candidate)) {
 				throw new Error("Stage action refers to a stale or unowned candidate.");
 			}
-			const scope = new ProductiveScope(Math.min(state.policy.childMaxMs, this.currentPolicy().childMaxMs),
-				() => this.coordinatorRuntime.now(), outerSignal);
+			const scope = new ProductiveScope(outerSignal);
 			const generations = state.integration.generations;
 			let generation = generations.at(-1);
 			const nextNumber = generation?.status === "superseded" ? generation.number + 1 : generation?.number ?? 1;
@@ -1384,8 +1385,7 @@ export class IsolatedRunner {
 			const request = parseExecuteRequest(state.request);
 			const generation = state.integration.generations.at(-1);
 			if (action.action === "release") {
-				const scope = new ProductiveScope(Math.min(state.policy.childMaxMs, this.currentPolicy().childMaxMs),
-					() => this.coordinatorRuntime.now(), outerSignal);
+				const scope = new ProductiveScope(outerSignal);
 				if (action.taskId !== undefined || action.attempt !== undefined) {
 					if (!action.taskId || !action.attempt || action.generation !== (generation?.number ?? 1)) {
 						throw new Error("Candidate release requires the latest generation and exact task attempt.");
@@ -1434,8 +1434,7 @@ export class IsolatedRunner {
 				if (state.integration.generations.filter((item) => item.worktree && !item.cleanup?.every((step) => step.status === "completed")).length >= MAX_RETAINED_INTEGRATION_GENERATIONS) {
 					throw new Error("Retained integration worktree limit is exhausted.");
 				}
-				const scope = new ProductiveScope(Math.min(state.policy.childMaxMs, this.currentPolicy().childMaxMs),
-					() => this.coordinatorRuntime.now(), outerSignal);
+				const scope = new ProductiveScope(outerSignal);
 				const actualMain = await scope.call((context) => this.gitRuntime.inspectMain({ root }, context));
 				if (!isCleanCommitted(action.newMain) || !sameIdentity(actualMain, action.newMain)) {
 					throw new Error("Refresh requires the exact new clean Main identity.");
@@ -1513,8 +1512,7 @@ export class IsolatedRunner {
 				|| !generation.combinedTip || !sameIdentity(generation.combinedTip, action.expectedTip)
 				|| (terminal(state) && !(state.status === "completed" && action.action === "cleanup"))
 				|| (state.status !== "needs_attention" && !(state.status === "completed" && action.action === "cleanup"))) throw new Error("Integration action has a stale generation or combined tip.");
-			const scope = new ProductiveScope(Math.min(state.policy.childMaxMs, this.currentPolicy().childMaxMs),
-				() => this.coordinatorRuntime.now(), outerSignal);
+			const scope = new ProductiveScope(outerSignal);
 			const receipts = this.stageReceipts(generation);
 			if (action.action === "advance") {
 				if (generation.status !== "staging" || generation.stages.some((stage) => stage.status !== "staged")
@@ -1524,7 +1522,7 @@ export class IsolatedRunner {
 				const ready = readyPendingTasks(state).filter((task) => hasChangesetDependency(state, task.taskId)
 					&& stagedDependencySnapshot(state, task.taskId, action.expectedTip));
 				if (!ready.length) throw new Error("No dependent task is ready on this staged snapshot.");
-				await this.requireExactIntegration(handle, generation, receipts, scope);
+				await this.requireExactIntegration(handle, generation, receipts, scope, true);
 				return await this.run(handle, scope, undefined, action.expectedTip);
 			}
 			if (action.action === "cleanup") {
@@ -1825,7 +1823,7 @@ export class IsolatedRunner {
 	}
 
 	private async requireExactIntegration(handle: RunStateHandle, generation: IntegrationGeneration,
-		receipts: StageReceipt[], scope: RuntimeScope): Promise<void> {
+		receipts: StageReceipt[], scope: RuntimeScope, allowDirtyMain = false): Promise<void> {
 		const root = handle.state.root;
 		const worktree = generation.worktree!;
 		const tip = generation.correction
@@ -1845,7 +1843,8 @@ export class IsolatedRunner {
 			await this.callProductive(handle, scope, (context) => this.integrationGit.inspectWorker(root, worker as WorktreeInfo,
 				stage.source, context.signal));
 		}
-		const main = await this.callProductive(handle, scope, (context) => this.gitRuntime.inspectMain({ root }, context));
+		const main = await this.callProductive(handle, scope, (context) => allowDirtyMain
+			? this.gitRuntime.inspectMainBase({ root }, context) : this.gitRuntime.inspectMain({ root }, context));
 		if (!sameIdentity(main, generation.expectedMain)) throw new Error("Main changed or became dirty before promotion.");
 	}
 
@@ -1854,14 +1853,14 @@ export class IsolatedRunner {
 		return await this.store.withLock(root, async (lifecycle) => {
 			const handle = await this.store.load(root, id);
 			const state = handle.state;
-			if (terminal(state)) return this.response(state);
+			if (terminal(state) && state.status !== "aborted") return this.response(state);
 			if (state.integration.candidates.some((candidate) => candidate.worker !== "released")
 				|| state.integration.generations.some((generation) => generation.worktree
 					&& !generation.cleanup?.every((step) => step.status === "completed"))) {
 				throw new Error("Retained candidates and integration worktrees must be explicitly rejected and released before abort.");
 			}
 			const activeControls = this.activeControls(root, id);
-			for (const { control } of activeControls) control.invalidate();
+			for (const { control } of activeControls) control.close();
 			if (!activeControls.length
 				&& !lifecycle.productiveRunLeaseActive
 				&& this.recoverInterrupted(state)) {
@@ -1872,9 +1871,27 @@ export class IsolatedRunner {
 				if (task.kind !== "changeset") continue;
 				for (const attempt of task.attempts) {
 					if (!allocationByKind(attempt, "agent")?.agentName || attempt.termination?.status === "terminated") continue;
-					await this.terminateWithSafety(
-						handle, task, attempt, this.terminationCandidate(attempt), outerSignal, safetyDeadline, true,
-					);
+					if (attempt.termination) {
+						const safety = new DeadlineScope(safetyDeadline, () => this.coordinatorRuntime.now(), outerSignal);
+						try {
+							const result = await safety.call((context) => this.hostRuntime.reconcileWorkerTermination({
+								task: changesetTaskRequest(state, task.taskId), attempt,
+								workerId: attempt.termination!.workerId, candidate: attempt.termination!.candidate,
+							}, context));
+							if (result.outcome !== "terminated") throw new Error(result.outcome === "unknown"
+								? result.failure : "Exact worker remains active; termination was not replayed.");
+							attempt.termination = { ...attempt.termination, status: "terminated", at: this.coordinatorRuntime.now() };
+							delete attempt.termination.failure;
+						} catch (error) {
+							attempt.termination.status = "unknown";
+							attempt.termination.failure = errorText(error);
+							this.attention(task, attempt.termination.failure);
+						} finally { safety.close(); }
+					} else {
+						await this.terminateWithSafety(
+							handle, task, attempt, this.terminationCandidate(attempt), outerSignal, safetyDeadline, true,
+						);
+					}
 				}
 			}
 			state.status = "aborted";
@@ -1882,8 +1899,63 @@ export class IsolatedRunner {
 			state.accepted = false;
 			state.updatedAt = this.coordinatorRuntime.now();
 			await handle.save();
+			// In-flight checks or allocation callbacks must settle before removing their checkout.
+			if (!lifecycle.productiveRunLeaseActive) await this.cleanupAborted(handle, outerSignal);
 			return this.response(state);
 		}, { purpose: "abort" });
+	}
+
+	private async cleanupAborted(handle: RunStateHandle, signal?: AbortSignal): Promise<void> {
+		const state = handle.state;
+		const scope = new DeadlineScope(this.coordinatorRuntime.now() + CLEANUP_SAFETY_BUDGET_MS,
+			() => this.coordinatorRuntime.now(), signal);
+		try {
+			for (const task of state.tasks) {
+				if (task.kind !== "changeset") continue;
+				for (const attempt of task.attempts) {
+					if (attempt.cleanup.every((step) => step.status === "completed")) continue;
+					const worker = allocationByKind(attempt, "worktree")?.worktree;
+					const expected = worker ? { ...attempt.waveBase, branch: `refs/heads/${worker.branch}` } : undefined;
+					let pending = attempt.cleanup.find((step) => step.status !== "completed")!;
+					try {
+						if (attempt.allocations.some((item) => item.status === "allocating" || item.status === "unknown")) {
+							throw new Error("Allocation ownership is uncertain; preserve the recorded resources for inspection.");
+						}
+						if (allocationByKind(attempt, "agent") && attempt.termination?.status !== "terminated") {
+							throw new Error("Exact worker termination remains unproved.");
+						}
+						if (expected && attempt.termination && attempt.termination.candidate.head !== expected.head) {
+							throw new Error("Aborted worker may contain committed work; automatic cleanup preserves it.");
+						}
+						for (const step of attempt.cleanup) {
+							if (step.status === "completed") continue;
+							pending = step;
+							const kind = step.kind;
+							step.status = "running";
+							delete step.failure;
+							await handle.save();
+							if ((kind === "worker_tab" || kind === "workspace") && allocationByKind(attempt, kind)) {
+								const result = await scope.call((context) => this.hostRuntime.cleanupHost({
+									requestId: state.request.id, kind,
+									task: changesetTaskRequest(state, task.taskId), attempt,
+								}, context));
+								if (result.outcome === "blocked") throw new Error(result.failure);
+							} else if ((kind === "worktree" || kind === "branch") && worker && expected) {
+								const result = await scope.call((context) => this.integrationGit.release(state.root,
+									worker, expected, kind, context.signal));
+								if (result.outcome !== "ready") throw new Error(result.failure);
+							}
+							step.status = "completed";
+							await handle.save();
+						}
+					} catch (error) {
+						if (pending.status === "completed") pending.status = "running";
+						pending.failure = bounded(`Abort cleanup retained resources: ${errorText(error)}`);
+						await handle.save();
+					}
+				}
+			}
+		} finally { scope.close(); }
 	}
 
 	async status(id: string, root: string, outerSignal?: AbortSignal): Promise<RunResponse> {
@@ -1944,7 +2016,7 @@ export class IsolatedRunner {
 				}
 				let actualMain: WorkspaceIdentity;
 				try {
-					actualMain = await this.callProductive(handle, scope, async (context) => await this.gitRuntime.inspectMain({ root: state.root }, context));
+					actualMain = await this.callProductive(handle, scope, async (context) => await this.gitRuntime.inspectMainBase({ root: state.root }, context));
 				} catch (error) {
 					this.rethrowStopped(error);
 					const failure = isDeadline(error, scope)
@@ -1961,7 +2033,7 @@ export class IsolatedRunner {
 				}
 				if (stagedSnapshot) {
 					const generation = state.integration.generations.at(-1)!;
-					await this.requireExactIntegration(handle, generation, this.stageReceipts(generation), scope);
+					await this.requireExactIntegration(handle, generation, this.stageReceipts(generation), scope, true);
 				}
 				const wave: WaveState = {
 					number: state.waves.length + 1,
@@ -2206,7 +2278,8 @@ export class IsolatedRunner {
 			if (!wave?.taskIds.includes(task.taskId)) throw new Error("Text task lacks a recorded launch wave.");
 			const baseRoot = wave.base.head === state.main.head ? state.root : state.integration.generations.at(-1)?.worktree?.path;
 			if (!baseRoot) throw new Error("Staged dependency checkout is unavailable.");
-			if (!sameIdentity(await this.gitRuntime.inspectMain({ root: baseRoot }, context), wave.base)) {
+			const inspectBase = baseRoot === state.root ? this.gitRuntime.inspectMainBase.bind(this.gitRuntime) : this.gitRuntime.inspectMain.bind(this.gitRuntime);
+			if (!sameIdentity(await inspectBase({ root: baseRoot }, context), wave.base)) {
 				throw new Error("Staged dependency snapshot drifted before text launch.");
 			}
 			const isolated = await createChildWorktree(
@@ -2214,10 +2287,18 @@ export class IsolatedRunner {
 				`${state.request.id}-${task.taskId}-text-${attempt.number}`,
 				undefined,
 				context.signal,
+				async (worktree) => {
+					if (worktree.baseCommit !== wave.base.head || !sameIdentity(await inspectBase({ root: baseRoot }, context), wave.base)) {
+						throw new Error("Staged dependency snapshot drifted before text worktree creation.");
+					}
+				},
 			);
 			if (!isolated) throw new Error("Explicit isolated text work requires a Git checkout with a committed HEAD; it never falls back to Main.");
 			let result;
 			try {
+				if (!sameIdentity(await inspectBase({ root: baseRoot }, context), wave.base)) {
+					throw new Error("Staged dependency snapshot drifted during text worktree creation.");
+				}
 				const launchHandle = await this.coordinatorRuntime.acquireLaunch(request.role, request.modelClass, context);
 				if (launchHandle.launch.role !== request.role || launchHandle.launch.modelClass !== request.modelClass) {
 					await withTransientLaunch(launchHandle, async () => {
@@ -2248,7 +2329,7 @@ export class IsolatedRunner {
 		if (Buffer.byteLength(output, "utf8") > MAX_PERSISTED_RUNTIME_TEXT_BYTES) {
 			throw new Error(`Text task executor output exceeds ${MAX_PERSISTED_RUNTIME_TEXT_BYTES} UTF-8 bytes.`);
 		}
-		const actualMain = await this.callProductive(handle, scope, async (context) => await this.gitRuntime.inspectMain({ root: state.root }, context));
+		const actualMain = await this.callProductive(handle, scope, async (context) => await this.gitRuntime.inspectMainBase({ root: state.root }, context));
 		if (!sameIdentity(actualMain, state.main)) throw new Error("Main drifted during text task execution.");
 		const wave = state.waves.at(-1)!;
 		if (wave.base.head !== state.main.head) {
@@ -2256,7 +2337,7 @@ export class IsolatedRunner {
 			if (!generation?.worktree || generation.status === "superseded" || !sameIdentity(generation.combinedTip!, wave.base)) {
 				throw new Error("Staged dependency snapshot was superseded during text task execution.");
 			}
-			await this.requireExactIntegration(handle, generation, this.stageReceipts(generation), scope);
+			await this.requireExactIntegration(handle, generation, this.stageReceipts(generation), scope, true);
 		}
 		attempt.status = "completed";
 		attempt.failure = undefined;
@@ -2642,10 +2723,7 @@ export class IsolatedRunner {
 		if (!attempt.readiness || !attempt.candidate || !attempt.candidateBase || !attempt.preliminaryChecks
 			|| !sameIdentity(attempt.readiness.candidate, attempt.candidate)
 			|| !sameIdentity(attempt.readiness.base, attempt.candidateBase)
-			|| !checkBatchPasses(attempt.preliminaryChecks, request.checks, attempt.candidate)
-			|| (request.judgment && !reviewEvidencePasses(attempt.preliminaryReview, "preliminary",
-				request.judgment.criterion, attempt.candidateBase, attempt.candidate))
-			|| !allocationByKind(attempt, "agent")?.agentName || attempt.termination) {
+			|| !hasPassingPreliminaryEvidence(request, attempt)) {
 			throw new Error(`Task ${task.taskId} has no exact ready live candidate.`);
 		}
 		if (state.integration.candidates.some((candidate) => candidate.taskId === task.taskId && !candidate.decision)) {
@@ -2673,30 +2751,23 @@ export class IsolatedRunner {
 			root: handle.state.root, task: changesetTaskRequest(handle.state, task.taskId), attempt,
 		}, context)), "Retained task candidate identity");
 		if (!isCleanCommitted(candidate)) throw new Error("Retained task candidate is not clean and committed.");
-		if (attempt.readiness) {
-			if (!sameIdentity(candidate, attempt.readiness.candidate)) throw new Error("Ready retained task candidate drifted from its exact lineage.");
-			task.status = "ready_to_integrate";
-			task.failure = undefined;
-			await this.saveProductive(handle);
-			this.retainCandidate(handle.state, task);
-			handle.state.status = "needs_attention";
-			await this.saveProductive(handle);
-			return this.response(handle.state);
-		}
 		const request = changesetTaskRequest(handle.state, task.taskId);
 		if (!attempt.candidate || !attempt.candidateBase || !sameIdentity(candidate, attempt.candidate)
-			|| !checkBatchPasses(attempt.preliminaryChecks, request.checks, candidate)) {
-			throw new Error("Retained task work lacks exact passing preliminary candidate evidence.");
+			|| !hasPassingPreliminaryEvidence(request, attempt)) {
+			throw new Error("Retained task work lacks exact passing preliminary checks, judgment or live ownership.");
 		}
-		attempt.readiness = {
+		if (attempt.readiness && (!sameIdentity(candidate, attempt.readiness.candidate)
+			|| !sameIdentity(attempt.candidateBase, attempt.readiness.base))) {
+			throw new Error("Ready retained task candidate drifted from its exact lineage.");
+		}
+		attempt.readiness ??= {
 			candidate: attempt.candidate,
 			base: attempt.candidateBase,
 			at: nextAttemptEventAt(attempt, this.coordinatorRuntime.now()),
 		};
+		this.retainCandidate(handle.state, task);
 		task.status = "ready_to_integrate";
 		task.failure = undefined;
-		await this.saveProductive(handle);
-		this.retainCandidate(handle.state, task);
 		handle.state.status = "needs_attention";
 		await this.saveProductive(handle);
 		return this.response(handle.state);
@@ -2902,6 +2973,24 @@ export class IsolatedRunner {
 	}
 
 	private recoverInterrupted(state: RunState): boolean {
+		if (state.status === "needs_attention") {
+			let changed = false;
+			for (const task of state.tasks) {
+				if (task.kind !== "changeset" || task.status !== "ready_to_integrate"
+					|| state.integration.candidates.some((candidate) => candidate.taskId === task.taskId)) continue;
+				const attempt = latestAttempt(task);
+				if (hasPassingPreliminaryEvidence(changesetTaskRequest(state, task.taskId), attempt)) {
+					this.attention(task, "Candidate readiness was saved before retention; verify to reconstruct the candidate from exact passing evidence.");
+					changed = true;
+					continue;
+				}
+				delete attempt.readiness;
+				this.attention(task, "Readiness lacked passing preliminary checks, judgment or live ownership; retained work requires attention.");
+				changed = true;
+			}
+			if (changed) state.updatedAt = this.coordinatorRuntime.now();
+			return changed;
+		}
 		if (state.status === "pending") {
 			const ready = readyPendingTasks(state).filter((task) => task.attempts.length === 0);
 			if (!ready.length) return false;
@@ -3039,9 +3128,6 @@ export class IsolatedRunner {
 			if (attempt?.status === "running") {
 				attempt.status = "failed";
 				attempt.failure = boundedFailure;
-			} else {
-				if (task.attempts.length >= 2) throw new Error(`Text task ${task.taskId} cannot record another failed attempt.`);
-				task.attempts.push({ number: task.attempts.length + 1, status: "failed", failure: boundedFailure });
 			}
 		}
 		task.status = "needs_attention";
@@ -3064,11 +3150,13 @@ export class IsolatedRunner {
 				continuation = { id: state.request.id, action: "retry", taskId: attention.taskId };
 			} else if (attention?.kind === "changeset" && !attention.attempts.at(-1)?.termination) {
 				const attempt = attention.attempts.at(-1);
-				if (attempt && this.correctionAllowed(state, changesetTaskRequest(state, attention.taskId), attempt)) {
+				const hasEvidence = Boolean(attempt && !state.integration.candidates.length
+					&& hasPassingPreliminaryEvidence(changesetTaskRequest(state, attention.taskId), attempt));
+				if (attempt?.readiness && hasEvidence) {
+					continuation = { id: state.request.id, action: "verify", taskId: attention.taskId };
+				} else if (attempt && this.correctionAllowed(state, changesetTaskRequest(state, attention.taskId), attempt)) {
 					continuation = { id: state.request.id, action: "retry", taskId: attention.taskId };
-				} else if ((attempt?.readiness && !state.integration.candidates.length)
-					|| (attempt?.candidate && attempt.candidateBase
-						&& checkBatchPasses(attempt.preliminaryChecks, changesetTaskRequest(state, attention.taskId).checks, attempt.candidate))) {
+				} else if (hasEvidence) {
 					continuation = { id: state.request.id, action: "verify", taskId: attention.taskId };
 				}
 			}
@@ -3080,6 +3168,9 @@ export class IsolatedRunner {
 			text: bounded([
 				`Pi Subagent ${state.request.id}: ${state.status}.`,
 				`Tasks: ${completed}/${state.tasks.length} completed, ${rejected} rejected. Accepted: ${state.accepted}.`,
+				...(state.status === "aborted" && state.tasks.some((task) => task.kind === "changeset"
+					&& task.attempts.some((attempt) => attempt.cleanup.some((step) => step.status !== "completed")))
+					? ["Aborted resources remain retained. Inspect cleanup evidence; retry subagent_abort after active work settles or cleanup blockers are resolved. Unique commits and uncertain work are never discarded."] : []),
 				...(main?.status === "current" ? ["Main: current at the recorded exact identity."] : []),
 				...(main?.status === "drifted" ? [
 					`Main: drifted from ${main.expected.branch}@${main.expected.head} to ${main.actual.branch}@${main.actual.head}.`,

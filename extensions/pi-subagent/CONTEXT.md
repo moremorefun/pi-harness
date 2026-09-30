@@ -13,7 +13,7 @@ Own Role-configured Pi delegation through one `delegate_task` surface:
 - **Main**: the Pi session and checkout coordinating delegated work.
 - **Role**: package or user Markdown defining responsibility, tools, trusted extension sources, Skills, optional MCP names, instructions, and an optional model-class default. Roles do not select isolation.
 - **Model Class**: `fast`, `balanced`, `frontier`, or `fav`, resolved through `pi-task-models`.
-- **Direct task**: one read-only assignment in a Herdr tab in Main's current workspace.
+- **Direct task**: one task using read-only base tools in a Herdr tab in Main's current workspace; trusted extensions and MCP servers are not read-only constrained.
 - **Isolated request**: one durable ID, goal, and checked task graph.
 - **Candidate**: exact clean committed task-worktree identity produced by an isolated changeset worker.
 - **Readiness**: durable proof that one exact live-worker candidate passed its preliminary checks and is sealed for Main's explicit selection; it is not a separate user approval.
@@ -41,7 +41,7 @@ Own Role-configured Pi delegation through one `delegate_task` surface:
 
 ### Direct evidence
 
-- Direct mode admits only Roles proven read-only from declared tools, extensions, and MCP resources. Direct changesets and write-capable Roles require isolated mode.
+- Direct mode admits Roles with known read-only base tools. Extensions and MCP servers are trusted without a read-only guarantee; direct changesets and Roles with write-capable base tools require isolated mode.
 - Each direct worker has a recorded Herdr tab and Pi session identity. The first handle returns before completion; subsequent tab identities remain recoverable on the session branch.
 - An exact settled worker with a bounded final Pi answer produces a follow-up to Main. Blocked, unknown, idle-stalled, truncated, or ambiguous outcomes retain actionable recovery identity. Session replacement never delivers to the wrong Main session.
 
@@ -50,6 +50,7 @@ Own Role-configured Pi delegation through one `delegate_task` surface:
 - Changeset tasks durably record allocation intent before each external side effect. Unknown outcomes are retained and never guessed.
 - One worker remains live across prompts, preliminary checks, follow-up/correction, readiness, Main's staging decisions, combined validation, and guarded promotion. Selected workers terminate after promotion; rejected workers terminate on explicit rejection.
 - Optional same-worker follow-ups are admitted only while a changeset is actively working. After the final checked-evidence save, one synchronous queue-or-seal transition prevents admitted revisions from being lost; the runner never waits for routine input.
+- Worker waves pin Main's committed branch/HEAD/tree, excluding staged, unstaged, and untracked changes; dirty Main permits checked candidate readiness, but branch/HEAD drift blocks dispatch and clean Main is required before staging, combined validation, or promotion.
 - Preliminary checks gate readiness. Any changed candidate invalidates previous readiness and validation.
 - Optional task judgment binds to the exact preliminary candidate. Main selects and orders candidates in a separate owned integration checkout, where final full-suite checks and optional final judgment bind to the clean combined tip before promotion.
 - Promotion requires exact unchanged clean Main and a passing combined generation. Durable promotion evidence precedes selected-worker termination and cleanup; recovery never rolls back a proven promotion.
@@ -75,7 +76,7 @@ Own Role-configured Pi delegation through one `delegate_task` surface:
 - Recognized Pi JSON events renew idle timeout; raw bytes do not. Child maximum runtime always terminates ephemeral children.
 - Output, stderr, protocol events, callback draining, and inherited descendant streams are bounded.
 - Low-level worktree finalization returns explicit `pruned`, `retained`, or `recovery` evidence and never force-deletes uncertain work.
-- Exact review and working-change helpers produce bounded private evidence; callers must preserve identity guards and verdict validation.
+- Exact review helpers produce bounded private evidence; callers must preserve identity guards and verdict validation.
 
 ## Owned storage
 

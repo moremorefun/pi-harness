@@ -90,7 +90,7 @@ Available inventory includes this provenance:
 }
 ```
 
-It also sets `worktreeVerified:false`. Staged adds, changes, and deletes affect the snapshot. Unstaged changes, deletions, mode changes, symlinks, and untracked files do not. Inspect current candidate files before assigning ownership; abstain if targeted current-file checks cannot be done safely.
+It also sets `worktreeVerified:false`. Staged adds, changes, and deletes affect the Git-index collections. Unstaged changes, deletions, mode changes, symlinks, and untracked files do not affect those collections. Skills come from Pi's effective registry and can include untracked files. Inspect current candidate files before assigning ownership; abstain if targeted current-file checks cannot be done safely.
 
 ## Flow
 
@@ -100,6 +100,7 @@ Search makes no model calls.
 
 ### Query and index
 
+- Discovery trims the query, then truncates it to 512 characters before matching; text beyond that cap is ignored.
 - Prefer distinctive identifiers, package names, issue numbers, or uncommon terms. Use quoted phrases only when exact wording is known.
 - The FTS5 trigram index uses AND for multiple words by default. Use `OR` for breadth, quoted phrases for exact matches, and `NOT` to exclude. Wildcards help only stems at least three characters long.
 - Only user and assistant text is indexed. Thinking blocks and tool output are not searchable.
@@ -140,7 +141,7 @@ Session files over 32 MiB are excluded from indexing and hydration, so discovery
 
 Pattern preparation runs one sync pass. A positive backlog or incomplete walk limits the sample and sets `sync.complete:false`. A total sync or required repository-inventory failure returns an explicit tool error.
 
-Repository scope fails outside Git or when repository inventory fails. All scope still returns its corpus in both cases. Outside Git, all scope sets `inventory.available:false` with `reason:"not-a-git-repository"`. On a repository inventory error, it uses `reason:"inventory-failed"`. Cancellation always aborts the call instead of returning unavailable inventory.
+Repository scope fails outside Git or when repository inventory fails. All scope still returns its corpus when Git-root lookup exits nonzero (`inventory.available:false`, `reason:"not-a-git-repository"`) or inventory fails after the root is resolved (`reason:"inventory-failed"`). If the working directory cannot be resolved, Git cannot start, root lookup overflows or produces invalid output or unexpected stderr, or the call is cancelled, preparation fails even with all scope; these failures do not return unavailable inventory.
 
 Preparation rejects `query`, session cursors, or `window` in the same call. It also rejects `scope` without the operation.
 

@@ -148,6 +148,23 @@ export class CheckedGitRuntime implements GitRuntime, TaskCandidateInspector, In
 		});
 	}
 
+	/** Pin the checked-out committed tree without reading or changing Main's dirty index/worktree. */
+	async inspectMainBase(input: { root: string }, context: OperationContext): Promise<WorkspaceIdentity> {
+		const cwd = input.root;
+		const branch = oneLine(await this.requireGit(["symbolic-ref", "--quiet", "HEAD"], cwd, context), "branch reference");
+		const head = oid(await this.requireGit(["rev-parse", "--verify", "HEAD^{commit}"], cwd, context), "HEAD");
+		const entries = await this.requireGit(["ls-tree", "-r", "-z", head], cwd, context);
+		if (entries.split("\0").some((entry) => entry.startsWith("160000 "))) {
+			throw new Error("Pi Subagent does not support Git repositories containing mode-160000 gitlinks.");
+		}
+		const tree = oid(await this.requireGit(["rev-parse", "--verify", `${head}^{tree}`], cwd, context), "HEAD tree");
+		if (branch !== oneLine(await this.requireGit(["symbolic-ref", "--quiet", "HEAD"], cwd, context), "branch reference")
+			|| head !== oid(await this.requireGit(["rev-parse", "--verify", "HEAD^{commit}"], cwd, context), "HEAD")) {
+			throw new Error("Git workspace changed during committed Main inspection.");
+		}
+		return { branch, head, index: tree, tree };
+	}
+
 	async allocateWorktree(input: {
 		root: string;
 		baseRoot?: string;
@@ -168,7 +185,10 @@ export class CheckedGitRuntime implements GitRuntime, TaskCandidateInspector, In
 		let prepared: WorktreeAllocationPlan | undefined;
 		let createdWorktree: WorktreeAllocationPlan | undefined;
 		const baseRoot = input.baseRoot ?? input.root;
-		const before = await this.inspectWorkspace(baseRoot, false, context);
+		const inspectBase = () => baseRoot === input.root
+			? this.inspectMainBase({ root: baseRoot }, context)
+			: this.inspectWorkspace(baseRoot, false, context);
+		const before = await inspectBase();
 		if (!sameIdentity(before, input.attempt.waveBase)) {
 			return { kind: "worktree", outcome: "absent", failure: "Recorded wave snapshot drifted before worktree allocation." };
 		}
@@ -184,7 +204,7 @@ export class CheckedGitRuntime implements GitRuntime, TaskCandidateInspector, In
 						throw new Error("pi-subagent prepared a worktree from a base other than the recorded wave base.");
 					}
 					await input.onPrepared(prepared);
-					const current = await this.inspectWorkspace(baseRoot, false, context);
+					const current = await inspectBase();
 					if (!sameIdentity(current, input.attempt.waveBase)) {
 						throw new Error("Recorded wave snapshot drifted after worktree preparation and before git worktree add.");
 					}
@@ -202,7 +222,7 @@ export class CheckedGitRuntime implements GitRuntime, TaskCandidateInspector, In
 					possibleResources: [worktree.path, worktree.branch],
 				};
 			}
-			const after = await this.inspectWorkspace(baseRoot, false, context);
+			const after = await inspectBase();
 			if (!sameIdentity(after, input.attempt.waveBase)) {
 				return {
 					kind: "worktree",

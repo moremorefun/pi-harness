@@ -18,13 +18,14 @@ function harness(options: { ui?: boolean; mode?: "tui" | "rpc"; inventory?: Isol
 	const entries = ["root", "leaf", "existing-child", "sibling"];
 	let active = true;
 	let inspectCount = 0;
+	let inventoryCount = 0;
 	let recoverCount = 0;
 	const messages: string[] = [];
 	let recoverPause: (() => Promise<void>) | undefined;
 	const inventory = options.inventory ?? { root: "/git", requests: [{ id: "request", name: "Same", status: "working", tasks: [{ id: "task", name: "Same", kind: "changeset", status: "working" }, { id: "other", name: "Same", kind: "changeset", status: "working" }] }], invalidIds: [] };
 	const adapter: SubagentCommandAdapter = {
 		direct: () => options.direct ?? [],
-		isolated: async () => { if (options.isolatedError) throw options.isolatedError; return inventory; },
+		isolated: async (_cwd, current) => { inventoryCount++; assert.equal(current(), true); if (options.isolatedError) throw options.isolatedError; return inventory; },
 		recover: async () => { recoverCount++; await recoverPause?.(); return "Recovery report for Main"; },
 		inspectInTab: async (_root, id, _ctx, current) => {
 			assert.equal(current(), true); inspectCount++;
@@ -76,6 +77,7 @@ function harness(options: { ui?: boolean; mode?: "tui" | "rpc"; inventory?: Isol
 		get recoverCount() { return recoverCount; },
 		setActive: (value: boolean) => { active = value; },
 		get inspectCount() { return inspectCount; },
+		get inventoryCount() { return inventoryCount; },
 		changeSession: () => { session = "next"; }, changeFile: () => { file = "next.jsonl"; },
 		changeBranch: () => { branch = ["root", "sibling"]; }, navigateAncestor: () => { branch = ["root"]; },
 		navigateDescendant: () => { branch.push("existing-child"); },
@@ -98,6 +100,13 @@ test("direct recovery, history and duplicate labels retain exact records", async
 	assert.equal(h.inspectCount, 1);
 	assert.ok(h.dialogs[0]!.options!.some((label) => label.includes("Isolated")));
 	assert.ok(h.dialogs[0]!.options!.some((label) => label.includes("Direct")));
+});
+
+test("Refresh reloads the isolated inventory for the widget as well as the picker", async () => {
+	const h = harness();
+	h.responses.push(h.pick("Refresh"), h.pick("Close"));
+	await h.run();
+	assert.equal(h.inventoryCount, 2);
 });
 
 test("inspection launches a Herdr tab without queuing a Main turn or changing work", async () => {

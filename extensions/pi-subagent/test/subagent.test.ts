@@ -5,8 +5,10 @@ import { chmod, mkdir, mkdtemp, realpath, rm, stat, symlink, writeFile } from "n
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import test from "node:test";
+import { Compile } from "typebox/compile";
 import { type ExtensionAPI, type ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { PI_SUBAGENT_PROCESS_LEASE, ROLE_TOOL_POLICY_FLAG } from "@henryqw/pi-subagent";
+import { roleCanWrite, roleIsReadOnlyScout } from "../extensions/admission.ts";
 import roleTools from "../extensions/role-tools.ts";
 import subagentExtension from "../extensions/subagent.ts";
 
@@ -24,8 +26,22 @@ type Tool = {
 
 type ToolCallHandler = (event: any) => unknown;
 
-function loadRoleTools(processLease: string | undefined): { events: string[]; toolCall?: ToolCallHandler } {
+test("direct admission trusts configured extensions and MCP servers but rejects write tools", () => {
+	const role = {
+		name: "reader", description: "Read sources", systemPrompt: "Read only.",
+		tools: ["read", "grep"], extensions: ["npm:@example/reader"], skills: [], mcps: ["docs"],
+	};
+	assert.equal(roleCanWrite(role), false);
+	assert.equal(roleCanWrite({ ...role, tools: ["read", "bash"] }), true);
+	assert.equal(roleIsReadOnlyScout({ ...role, extensions: [], mcps: [] }), true);
+	assert.equal(roleIsReadOnlyScout({ ...role, extensions: [], mcps: ["docs"] }), false);
+	assert.equal(roleIsReadOnlyScout({ ...role, mcps: [] }), false);
+	assert.equal(roleIsReadOnlyScout({ ...role, extensions: [], mcps: [], tools: ["bash"] }), false);
+});
+
+function loadRoleTools(processLease: string | undefined): { events: string[]; toolCall?: ToolCallHandler; childUmask: number } {
 	const previousLease = process.env[PI_SUBAGENT_PROCESS_LEASE];
+	const previousUmask = process.umask();
 	if (processLease === undefined) delete process.env[PI_SUBAGENT_PROCESS_LEASE];
 	else process.env[PI_SUBAGENT_PROCESS_LEASE] = processLease;
 	const events: string[] = [];
@@ -39,8 +55,9 @@ function loadRoleTools(processLease: string | undefined): { events: string[]; to
 				if (event === "tool_call") toolCall = handler;
 			},
 		} as unknown as ExtensionAPI);
-		return { events, toolCall };
+		return { events, toolCall, childUmask: process.umask() };
 	} finally {
+		process.umask(previousUmask);
 		if (previousLease === undefined) delete process.env[PI_SUBAGENT_PROCESS_LEASE];
 		else process.env[PI_SUBAGENT_PROCESS_LEASE] = previousLease;
 	}
@@ -70,7 +87,12 @@ for (const entry of readdirSync("/dev/fd")) {
 }
 throw new Error("process lease descriptor was not inherited");
 `);
-	const extension = loadRoleTools(lease);
+	const parentUmask = process.umask(0o022);
+	let extension: ReturnType<typeof loadRoleTools>;
+	try {
+		extension = loadRoleTools(lease);
+		assert.equal(extension.childUmask, 0o022, "worker tools must preserve ordinary file creation permissions");
+	} finally { process.umask(parentUmask); }
 	assert.equal(extension.events.filter((event) => event === "tool_call").length, 1);
 	assert.ok(extension.toolCall);
 	const bash = {
@@ -277,6 +299,42 @@ function harness(options: {
 		commands,
 	};
 }
+
+test("registered tools have object roots and preserve closed union validation", async () => {
+	await environment(async () => {
+		const app = harness();
+		for (const tool of app.tools.values()) {
+			const schema = tool.parameters as { type?: string; properties?: unknown; anyOf?: unknown; oneOf?: unknown };
+			assert.equal(schema.type, "object", tool.name);
+			assert.ok(schema.properties, tool.name);
+			assert.equal(schema.anyOf, undefined, tool.name);
+			assert.equal(schema.oneOf, undefined, tool.name);
+		}
+		const tip = { branch: "refs/heads/main", head: "a".repeat(40), index: "a".repeat(40), tree: "a".repeat(40) };
+		const inputs = [
+			["delegate_task", { mode: "direct", role: "worker", name: "Inspect", task: "Inspect the patch." }, "mode"],
+			["subagent_resume", { id: "request-one", action: "retry", taskId: "task-one" }, "action"],
+			["subagent_integrate", { id: "request-one", action: "validate", generation: 1, expectedTip: tip }, "action"],
+		] as const;
+		for (const [name, input, discriminant] of inputs) {
+			const validator = Compile(JSON.parse(JSON.stringify(app.tools.get(name)!.parameters)));
+			assert.ok(validator.Check(input), name);
+			assert.equal(validator.Check({ ...input, extra: true }), false, name);
+			assert.equal(validator.Check({ ...input, [discriminant]: "unknown" }), false, name);
+			const missingDiscriminant: Record<string, unknown> = { ...input };
+			delete missingDiscriminant[discriminant];
+			assert.equal(validator.Check(missingDiscriminant), false, name);
+		}
+		const isolated = { mode: "isolated", id: "request-one", goal: "Inspect the change", tasks: [{
+			id: "task-one", kind: "text", role: "scout", modelClass: "fast", requirements: "Inspect",
+			deliverable: "Report", dependsOn: [], contextFrom: [],
+		}] };
+		assert.ok(Compile(JSON.parse(JSON.stringify(app.tools.get("delegate_task")!.parameters))).Check(isolated));
+		assert.throws(() => app.tools.get("subagent_resume")!.prepareArguments!({ id: "request-one", action: "retry" }), /one strict action/);
+		assert.throws(() => app.tools.get("subagent_integrate")!.prepareArguments!({ id: "request-one", action: "refresh", generation: 1, expectedTip: tip }), /exact generation and tip/);
+		assert.throws(() => app.tools.get("delegate_task")!.prepareArguments!({ mode: "isolated", id: "request-one" }), /strict task schema/);
+	});
+});
 
 async function recoverDirect(app: ReturnType<typeof harness>): Promise<void> {
 	let shown = false;

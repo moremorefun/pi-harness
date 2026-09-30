@@ -40,6 +40,7 @@ import {
 } from "../src/schema.ts";
 import { FileRunStore, type RunStateHandle } from "../src/store.ts";
 import { IntegrationGit, type StageReceipt, type GitOutcome } from "../src/integration-git.ts";
+import { CheckedGitRuntime } from "../src/git-runtime.ts";
 import type { WorktreeInfo } from "../src/worktree.ts";
 
 const oid = (character: string): string => character.repeat(40);
@@ -68,6 +69,7 @@ type WorkerContextCall = {
 class FakeRuntime implements CoordinatorRuntime, HostRuntime, GitRuntime, TaskCandidateInspector {
 	clock = 1_000;
 	main = identity("a");
+	mainDirty = false;
 	integrationIdentity?: WorkspaceIdentity;
 	integrationPath?: string;
 	workerBarrierSize = 0;
@@ -155,7 +157,12 @@ class FakeRuntime implements CoordinatorRuntime, HostRuntime, GitRuntime, TaskCa
 		}
 		const failure = this.inspectMainFailures.shift();
 		if (failure) throw failure;
+		if (this.mainDirty) throw new Error("Git workspace is not clean.");
 		return { ...this.main };
+	}
+
+	async inspectMainBase(input: Parameters<GitRuntime["inspectMainBase"]>[0], context: OperationContext): Promise<WorkspaceIdentity> {
+		return this.mainDirty ? { ...this.main } : await this.inspectMain(input, context);
 	}
 
 	async inspectTaskCandidate(
@@ -862,6 +869,72 @@ test("abort during agent startup waits for durable ownership and terminates that
 	assertParsed(aborted.state);
 });
 
+test("abort cleans unchanged no-candidate allocations and safely retries retained cleanup", async (t) => {
+	for (const mode of ["clean", "untracked", "ignored", "committed", "interrupted", "termination"] as const) {
+		await t.test(mode, async (t) => {
+			class ReleaseGit extends IntegrationGit {
+				interrupted = false;
+				override async release(...args: Parameters<IntegrationGit["release"]>): ReturnType<IntegrationGit["release"]> {
+					const result = await super.release(...args);
+					if (mode === "interrupted" && args[3] === "worktree" && result.outcome === "ready" && !this.interrupted) {
+						this.interrupted = true;
+						throw new Error("Interrupted after checkout removal, before receipt.");
+					}
+					return result;
+				}
+			}
+			const { root, runtime, runner } = await harness(t, { integrationGit: new ReleaseGit() });
+			const checked = new CheckedGitRuntime();
+			runtime.main = await checked.inspectMain({ root }, { signal: new AbortController().signal });
+			runtime.allocateWorktree = checked.allocateWorktree.bind(checked);
+			runtime.inspectTaskCandidate = checked.inspectTaskCandidate.bind(checked);
+			runtime.workerResults.push({ outcome: "blocked", diagnostic: "No commit." }, { outcome: "blocked", diagnostic: "No commit." });
+			const id = `abort-no-candidate-${mode}`;
+			const stopped = await runner.execute(request(id, [changesetTask("change")]), root);
+			assert.deepEqual(stopped.state.integration.candidates, []);
+			const attempt = changesetState(stopped.state, "change").attempts[0]!;
+			const worker = attempt.allocations.find((item) => item.kind === "worktree")!.worktree!;
+			const extra = join(worker.path, "scratch.txt");
+			if (["untracked", "ignored", "committed"].includes(mode)) await writeFile(extra, "preserve\n");
+			if (mode === "ignored") {
+				const exclude = join(root, ".git", "info", "exclude");
+				await writeFile(exclude, `${await readFile(exclude, "utf8")}\nscratch.txt\n`);
+			}
+			if (mode === "committed") {
+				execFileSync("git", ["add", "scratch.txt"], { cwd: worker.path });
+				execFileSync("git", ["-c", "user.name=Test", "-c", "user.email=test@example.com", "commit", "-qm", "retained work"], { cwd: worker.path });
+			}
+			if (mode === "termination") runtime.terminationResults.push({ outcome: "unknown", failure: "lease inspection interrupted" });
+			let aborted = await runner.abort(id, root);
+			assert.equal(aborted.state.status, "aborted");
+			if (mode !== "clean") {
+				assert.match(aborted.text, /retry subagent_abort/);
+				assert.ok(changesetState(aborted.state, "change").attempts[0]!.cleanup.some((step) => step.status !== "completed"));
+				assert.equal((await runner.listRequests(root)).requests[0]!.status, "aborted · retained");
+				assert.equal((await runner.recoverRepository(root)).requests[0]!.state.status, "aborted");
+			}
+			if (["untracked", "ignored", "committed"].includes(mode)) {
+				assert.equal(await readFile(extra, "utf8"), "preserve\n");
+				if (mode === "committed") return; // Unique work must never be deleted by abort.
+				await rm(extra);
+			}
+			if (mode === "termination") {
+				assert.deepEqual(runtime.cleanupCalls, []);
+				await runner.abort(id, root); // Active/unknown reconciliation never replays termination.
+				assert.equal(runtime.terminationCalls.length, 1);
+				runtime.terminationReconciliations.push({ outcome: "terminated" });
+			}
+			aborted = await runner.abort(id, root);
+			assert.ok(changesetState(aborted.state, "change").attempts[0]!.cleanup.every((step) => step.status === "completed"));
+			assert.doesNotMatch(execFileSync("git", ["worktree", "list", "--porcelain"], { cwd: root, encoding: "utf8" }), new RegExp(worker.branch));
+			const refs = execFileSync("git", ["for-each-ref", "--format=%(refname)"], { cwd: root, encoding: "utf8" });
+			assert.ok(!refs.includes(`refs/heads/${worker.branch}`));
+			assert.equal(runtime.terminationCalls.length, 1);
+			assertParsed(aborted.state);
+		});
+	}
+});
+
 test("a productive lease admits read-only status and abort during a paused worker but blocks execute and resume", async (t) => {
 	let releaseWorker!: () => void;
 	const workerPaused = new Promise<void>((resolve) => { releaseWorker = resolve; });
@@ -1071,6 +1144,7 @@ test("text producers feed ordered synthesis context into an integrated changeset
 		},
 	};
 	const { root, runtime, runner } = await harness(t, { executor });
+	runtime.main = await new CheckedGitRuntime().inspectMain({ root }, { signal: new AbortController().signal });
 	const definition = request("text-dataflow", [
 		textTask("source-one", "role/source-one"),
 		textTask("source-two", "role/source-two"),
@@ -1530,6 +1604,129 @@ test("failures enter needs_attention and require explicit recovery actions", asy
 
 });
 
+test("failed judgment cannot advertise or persist verification readiness, including legacy recovery", async (t) => {
+	const { root, runtime, runner, store } = await harness(t);
+	runtime.reviewVerdicts.push("Finding: incorrect candidate.", "Finding: still incorrect.");
+	const first = await runner.execute(request("failed-review-verify", [changesetTask("change", {
+		judgment: { role: "reviewer", modelClass: "fast", criterion: "Candidate must be correct." },
+	})]), root);
+	const failed = await runner.resume(first.continuation!, root);
+	assert.equal(failed.state.correctionCount, 1);
+	assert.equal(failed.continuation, undefined);
+	const before = (await runner.status("failed-review-verify", root)).state.tasks[0];
+	await assert.rejects(runner.resume({ id: "failed-review-verify", action: "verify", taskId: "change" }, root), /judgment/);
+	const after = await runner.status("failed-review-verify", root);
+	assert.deepEqual(after.state.tasks[0], before);
+	assert.deepEqual(after.state.integration.candidates, []);
+
+	// Reproduce a v5 record saved by the former verify path, then recover without replay.
+	const handle = await store.load(root, "failed-review-verify");
+	const task = changesetState(handle.state, "change");
+	const attempt = task.attempts[0]!;
+	attempt.readiness = { candidate: attempt.candidate!, base: attempt.candidateBase!, at: 2_000 };
+	task.status = "ready_to_integrate";
+	delete task.failure;
+	await handle.save();
+	assert.equal((await runner.status("failed-review-verify", root)).state.tasks[0]!.status, "ready_to_integrate");
+	const recovered = (await runner.recoverRepository(root)).requests[0]!;
+	assert.equal(recovered.state.tasks[0]!.status, "needs_attention");
+	assert.equal(changesetState(recovered.state, "change").attempts[0]!.readiness, undefined);
+	assert.equal(recovered.continuation, undefined);
+	assert.equal(runtime.workerCalls.length, 2);
+	assertParsed(recovered.state);
+});
+
+test("recovery exposes verify for passing legacy readiness without a retained candidate", async (t) => {
+	const { root, runtime, runner, store } = await harness(t);
+	await runner.execute(request("legacy-ready-verify", [changesetTask("change", {
+		judgment: { role: "reviewer", modelClass: "fast", criterion: "Candidate is correct." },
+	})]), root);
+	const handle = await store.load(root, "legacy-ready-verify");
+	const task = changesetState(handle.state, "change");
+	const readiness = structuredClone(task.attempts[0]!.readiness);
+	assert.ok(readiness);
+	handle.state.integration.candidates = [];
+	task.status = "ready_to_integrate";
+	delete task.failure;
+	await handle.save();
+
+	const recovered = (await runner.recoverRepository(root)).requests[0]!;
+	assert.equal(recovered.state.tasks[0]!.status, "needs_attention");
+	assert.deepEqual(recovered.continuation, { id: "legacy-ready-verify", action: "verify", taskId: "change" });
+	assert.deepEqual(changesetState(recovered.state, "change").attempts[0]!.readiness, readiness);
+	const verified = await runner.resume(recovered.continuation!, root);
+	assert.equal(verified.state.integration.candidates.length, 1);
+	assert.equal(verified.state.tasks[0]!.status, "ready_to_integrate");
+	assert.equal(runtime.workerCalls.length, 1);
+	assertParsed(verified.state);
+});
+
+test("verification preserves readiness and its candidate together across an interrupted save", async (t) => {
+	const { root, runner, store } = await harness(t, { createStore: (agentDir) => new RecordingStore(agentDir) });
+	await runner.execute(request("verify-atomic", [changesetTask("change", {
+		judgment: { role: "reviewer", modelClass: "fast", criterion: "Candidate is correct." },
+	})]), root);
+	const handle = await store.load(root, "verify-atomic");
+	handle.state.integration.candidates = [];
+	const task = changesetState(handle.state, "change");
+	task.status = "needs_attention";
+	task.failure = "Interrupted before candidate retention.";
+	delete task.attempts[0]!.readiness;
+	await handle.save();
+	const recording = store as RecordingStore;
+	recording.snapshots.length = 0;
+	recording.beforeSave = (state) => {
+		if (state.tasks[0]!.status !== "ready_to_integrate") return;
+		recording.beforeSave = undefined;
+		throw new Error("Interrupted readiness save.");
+	};
+	await assert.rejects(runner.resume({ id: "verify-atomic", action: "verify", taskId: "change" }, root), /Interrupted readiness save/);
+	const result = (await runner.recoverRepository(root)).requests[0]!;
+	assert.equal(result.state.integration.candidates.length, 1);
+	assert.ok(recording.snapshots.every((state) => state.tasks[0]!.status !== "ready_to_integrate"
+		|| state.integration.candidates.length === 1));
+	for (const snapshot of recording.snapshots) assertParsed(snapshot);
+});
+
+test("pre-dispatch text failures preserve both execution attempts and prior diagnostics", async (t) => {
+	let calls = 0;
+	const { root, runtime, runner, store } = await harness(t, { executor: { run: async () => {
+		calls += 1;
+		if (calls === 1) throw new Error("first actual child failed");
+		return { outcome: "success", exitCode: 0, output: "second child succeeded", outputTruncated: false, stderr: "" };
+	} } });
+	runtime.main = await new CheckedGitRuntime().inspectMain({ root }, { signal: new AbortController().signal });
+	runtime.inspectMainFailures.push(new Error("inspection unavailable"));
+	let result = await runner.execute(request("text-dispatch-budget", [textTask("research")]), root);
+	for (const status of ["pending", "running"] as const) {
+		const handle = await store.load(root, "text-dispatch-budget");
+		handle.state.status = status;
+		handle.state.tasks[0]!.status = "pending";
+		delete handle.state.tasks[0]!.failure;
+		await handle.save();
+		result = (await runner.recoverRepository(root)).requests[0]!;
+		assert.equal(result.state.tasks[0]!.attempts.length, 0);
+		assert.equal(calls, 0);
+	}
+	for (let inspection = 0; inspection < 2; inspection += 1) {
+		assert.equal(result.state.tasks[0]!.attempts.length, 0);
+		assert.equal(calls, 0);
+		assert.equal(result.continuation?.action, "retry");
+		runtime.inspectMainFailures.push(new Error("inspection still unavailable"));
+		result = await runner.resume(result.continuation!, root);
+	}
+	result = await runner.resume(result.continuation!, root);
+	assert.equal(calls, 1);
+	const history = structuredClone(result.state.tasks[0]!.attempts);
+	runtime.inspectMainFailures.push(new Error("inspection before second child failed"));
+	result = await runner.resume(result.continuation!, root);
+	assert.deepEqual(result.state.tasks[0]!.attempts, history);
+	result = await runner.resume(result.continuation!, root);
+	assert.equal(calls, 2);
+	assert.equal(result.state.status, "completed");
+	assert.deepEqual(textState(result.state, "research").attempts.map((attempt) => attempt.status), ["failed", "completed"]);
+});
+
 test("text dispatch uses the injected executor and persists a valid running intent and atomic completion", async (t) => {
 	let store: RecordingStore | undefined;
 	let persistedAtLaunch: RunState | undefined;
@@ -1552,6 +1749,7 @@ test("text dispatch uses the injected executor and persists a valid running inte
 		executor,
 		createStore: (agentDir) => (store = new RecordingStore(agentDir)),
 	});
+	runtime.main = await new CheckedGitRuntime().inspectMain({ root }, { signal: new AbortController().signal });
 	const definition = request("text-success", [textTask("research", "researcher/brief")]);
 
 	const result = await runner.execute(definition, root);
@@ -1632,6 +1830,7 @@ test("an interrupted text task remains failed until its explicit retry", async (
 		},
 	};
 	const { root, runtime, runner } = await harness(t, { executor });
+	runtime.main = await new CheckedGitRuntime().inspectMain({ root }, { signal: new AbortController().signal });
 	const definition = request("text-retry", [textTask("research")]);
 
 	const stopped = await runner.execute(definition, root);
@@ -1739,6 +1938,31 @@ class StagingGit extends IntegrationGit {
 		} };
 	}
 }
+
+test("dirty Main retains a checked candidate until exact clean Main allows staging and promotion", async (t) => {
+	const git = new StagingGit();
+	const { root, runtime, runner } = await harness(t, { integrationGit: git });
+	runtime.mainDirty = true;
+	const definition = request("dirty-admission", [changesetTask("change")]);
+	const ready = await runner.execute(definition, root);
+	assert.equal(ready.state.integration.candidates.length, 1);
+	assert.equal(ready.state.integration.generations.length, 0);
+	const candidate = ready.state.integration.candidates[0]!;
+	const action = { id: definition.id, action: "stage" as const, generation: 1,
+		taskId: candidate.taskId, attempt: candidate.attempt, candidate: candidate.tip, expectedTip: ready.state.main };
+	await assert.rejects(runner.stage(action, root), /not clean|Main changed or became dirty/);
+	assert.equal((await runner.status(definition.id, root)).state.integration.candidates.length, 1);
+	assert.equal(git.merged.length, 0);
+	runtime.mainDirty = false;
+	const staged = await runner.stage(action, root);
+	assert.equal(staged.state.integration.generations[0]?.stages[0]?.status, "staged");
+	const tip = staged.state.integration.generations[0]!.combinedTip!;
+	git.promoteMain = (main) => { runtime.main = main; };
+	const validated = await runner.integrate({ id: definition.id, action: "validate", generation: 1, expectedTip: tip }, root);
+	assert.equal(validated.state.integration.generations[0]?.status, "ready");
+	const completed = await runner.integrate({ id: definition.id, action: "promote", generation: 1, expectedTip: tip }, root);
+	assert.equal(completed.state.status, "completed");
+});
 
 test("Main can stage a checked worker while its sibling is still working", async (t) => {
 	const git = new StagingGit();
@@ -1907,7 +2131,7 @@ test("revision supersedes transitive text and changeset work; explicit advance r
 			output: await (await import("node:fs/promises")).readFile(join(prepared.cwd, "README.md"), "utf8") };
 	} };
 	const { runner, root, runtime } = await harness(t, { integrationGit: git, executor });
-	const checked = new (await import("../src/git-runtime.ts")).CheckedGitRuntime();
+	const checked = new CheckedGitRuntime();
 	runtime.main = await checked.inspectMain({ root }, { signal: new AbortController().signal });
 	const id = "staged-text-dependent";
 	const ready = await runner.execute(request(id, [{ ...changesetTask("second"), contextFrom: ["report"] },
@@ -1918,8 +2142,11 @@ test("revision supersedes transitive text and changeset work; explicit advance r
 	const tip = staged.state.integration.generations[0]!.combinedTip!;
 	runtime.integrationIdentity = tip;
 	runtime.integrationPath = staged.state.integration.generations[0]!.worktree!.path;
+	runtime.mainDirty = true;
 	const result = await runner.integrate({ id, generation: 1, action: "advance", expectedTip: tip }, root);
 	assert.equal(textState(result.state, "report").attempts[0]?.output?.text, "staged content 1", JSON.stringify(textState(result.state, "report")));
+	assert.ok(result.state.integration.candidates.some((candidate) => candidate.taskId === "second"));
+	runtime.mainDirty = false;
 	const oldDependent = result.state.integration.candidates.find((candidate) => candidate.taskId === "second")!;
 	const revised = await runner.stage({ id, action: "revise", generation: 1, taskId: "first", attempt: first.attempt,
 		candidate: first.tip, expectedTip: tip, instruction: "Change predecessor." }, root);

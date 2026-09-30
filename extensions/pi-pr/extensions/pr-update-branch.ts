@@ -24,7 +24,7 @@ import {
 	requiredOid,
 	resolveRepositoryFetchSource,
 	runChecked,
-	validateResolvedConflictPaths,
+	validatePaths,
 	withWorktreeLock,
 } from "./pr-execution.ts";
 
@@ -60,6 +60,8 @@ function sameAuthority(frozen: CurrentPullRequest, fresh: CurrentPullRequest): b
 type RebaseRecovery = { version: 1; phase: "pending" | "verified" | "published"; identity: string;
 	original: string; remote: string; verified: string | null };
 
+const isOid = (value: unknown): value is string => typeof value === "string" && /^(?:[0-9a-f]{40}|[0-9a-f]{64})$/.test(value);
+
 function recoveryIdentity(pr: CurrentPullRequest): string {
 	return JSON.stringify([pr.id, pr.number, pr.url.href, pr.host, pr.base.repository, pr.base.ref, pr.base.oid,
 		pr.head.repository, pr.head.ref, pr.target.provenance, pr.target.branch, pr.target.remote,
@@ -83,9 +85,7 @@ async function readRecovery(path: string, signal?: AbortSignal): Promise<RebaseR
 	if (!isRecord(record) || Object.keys(record).sort().join(",") !== "identity,original,phase,remote,verified,version" ||
 		record.version !== 1 || !["pending", "verified", "published"].includes(record.phase as string) ||
 		typeof record.identity !== "string" || record.identity.length > 2048 ||
-		typeof record.original !== "string" || !/^[0-9a-f]{40}$|^[0-9a-f]{64}$/.test(record.original) ||
-		typeof record.remote !== "string" || !/^[0-9a-f]{40}$|^[0-9a-f]{64}$/.test(record.remote) ||
-		(record.verified !== null && (typeof record.verified !== "string" || !/^[0-9a-f]{40}$|^[0-9a-f]{64}$/.test(record.verified))) ||
+		!isOid(record.original) || !isOid(record.remote) || (record.verified !== null && !isOid(record.verified)) ||
 		(record.phase === "pending" && record.verified !== null) ||
 		(record.phase !== "pending" && record.verified === null)) {
 		throw new Error(`Invalid branch update recovery is preserved at ${path}`);
@@ -142,7 +142,7 @@ export class PullRequestBranchUpdater {
 	}
 
 	private context(): PullRequestLoadContext {
-		return { cwd: this.cwd, signal: this.signal ?? new AbortController().signal };
+		return { cwd: this.cwd, signal: this.signal };
 	}
 
 	private async freshAuthority(expectedHead: string, requireClean: boolean, published = false): Promise<CurrentPullRequest> {
@@ -257,7 +257,7 @@ export class PullRequestBranchUpdater {
 			if (mergeCommits) throw new Error("Branch update cannot rebase a branch with merge commits; preserve its resolutions manually");
 			await this.freshAuthority(this.authority.head.oid, true);
 			await this.writeRecovery("pending", null);
-			const result = await this.exec("git", ["-c", "core.editor=true", "-c", "rebase.backend=merge", "rebase", "--no-autostash", "--onto", this.authority.base.oid, mergeBase], this.execOptions());
+			const result = await this.exec("git", ["-c", "core.editor=true", "-c", "rebase.backend=merge", "-c", "rebase.updateRefs=false", "rebase", "--no-autostash", "--onto", this.authority.base.oid, mergeBase], this.execOptions());
 			if (result.killed) throw new Error("git rebase was killed; its outcome is unknown");
 			if (result.code === 0) return await this.verifyRebase();
 			try {
@@ -272,7 +272,10 @@ export class PullRequestBranchUpdater {
 		if (this.state.phase !== "conflict-awaiting-user" || !this.state.conflict) {
 			throw new Error("Branch rebase has no conflict awaiting continuation");
 		}
-		const paths = validateResolvedConflictPaths(resolvedPaths, this.state.conflict.paths);
+		const paths = validatePaths(resolvedPaths, "Resolved conflict paths");
+		if (this.state.conflict.paths.some((path) => !paths.includes(path))) {
+			throw new Error("Resolved paths must include every original conflict path");
+		}
 		return await withWorktreeLock(this.cwd, async () => {
 			const discovery = await this.load(this.pi(), this.context());
 			if (discovery.kind !== "current" || !sameAuthority(this.authority, discovery.pullRequest)) {
@@ -289,7 +292,7 @@ export class PullRequestBranchUpdater {
 			await runChecked(this.exec, "git", ["--literal-pathspecs", "add", "--", ...paths], this.execOptions());
 			const unmerged = parseNulPaths((await runChecked(this.exec, "git", ["diff", "--name-only", "-z", "--diff-filter=U"], this.execOptions())).stdout, "Unmerged paths");
 			if (unmerged.length) throw new Error(`Conflict paths remain unresolved: ${unmerged.join(", ")}`);
-			const result = await this.exec("git", ["-c", "core.editor=true", "rebase", "--continue"], this.execOptions());
+			const result = await this.exec("git", ["-c", "core.editor=true", "-c", "rebase.updateRefs=false", "rebase", "--continue"], this.execOptions());
 			if (result.killed) throw new Error("git rebase continuation was killed; its outcome is unknown");
 			if (result.code === 0) return await this.verifyRebase();
 			return await this.captureConflict();

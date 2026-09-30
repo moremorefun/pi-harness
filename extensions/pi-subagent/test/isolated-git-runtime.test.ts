@@ -266,6 +266,39 @@ test("a cancelled queued main-index inspection keeps a later inspection behind t
 	assert.equal(maxConcurrentIndexOperations, 1);
 });
 
+test("dirty Main pins only committed HEAD for isolated allocation and checked candidacy", async (t) => {
+	const root = await repository(t);
+	const runtime = new CheckedGitRuntime();
+	const base = await runtime.inspectMain({ root }, context());
+	await writeFile(join(root, "base.txt"), "staged\n");
+	git(root, "add", "base.txt");
+	await writeFile(join(root, "base.txt"), "unstaged\n");
+	await writeFile(join(root, "untracked.txt"), "private\n");
+	const pinned = await runtime.inspectMainBase({ root }, context());
+	assert.deepEqual(pinned, base);
+	const definition = task("dirty-main");
+	const allocated = await allocate(runtime, root, definition, pinned, "token-dirty-main-01");
+	assert.equal(allocated.result.outcome, "owned");
+	assert.equal(await readFile(join(allocated.intent.worktree!.cwd, "base.txt"), "utf8"), "base\n");
+	await assert.rejects(readFile(join(allocated.intent.worktree!.cwd, "untracked.txt")), { code: "ENOENT" });
+	await commit(allocated.intent.worktree!.cwd, "worker.txt", "worker\n");
+	const candidate = await runtime.inspectRetainedTask({ root, task: definition, attempt: allocated.attempt }, context());
+	const checked = await runtime.runChecks({ root, scope: "task", taskId: definition.id, attempt: allocated.attempt,
+		checks: definition.checks, candidate }, context());
+	assert.equal(checksEvidence(candidate, checked).passed, true);
+	assert.equal(git(root, "rev-parse", "HEAD"), base.head);
+	assert.equal(await readFile(join(root, "base.txt"), "utf8"), "unstaged\n");
+	assert.equal(git(root, "show", ":base.txt"), "staged");
+	assert.equal(await readFile(join(root, "untracked.txt"), "utf8"), "private\n");
+	await assert.rejects(runtime.inspectMain({ root }, context()), /not clean/);
+	await commit(root, "drift.txt", "drift\n");
+	assert.notDeepEqual(await runtime.inspectMainBase({ root }, context()), pinned);
+	assert.equal((await allocate(runtime, root, task("drift"), pinned, "token-dirty-drift-01")).result.outcome, "absent");
+	const branchBase = await runtime.inspectMainBase({ root }, context());
+	git(root, "switch", "-qc", "other");
+	assert.equal((await allocate(runtime, root, task("branch-drift"), branchBase, "token-branch-drift-01")).result.outcome, "absent");
+});
+
 test("worktree allocation persists helper-derived intent before add and retains setup drift", async (t) => {
 	const root = await repository(t);
 	const calls: { command: string; args: string[]; options: DirectProcessOptions }[] = [];
