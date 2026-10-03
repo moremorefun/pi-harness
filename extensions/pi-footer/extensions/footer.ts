@@ -1,6 +1,6 @@
 import { readFile } from "node:fs/promises";
 import { basename, dirname, join } from "node:path";
-import type { ExtensionAPI, ExtensionContext, Theme } from "@earendil-works/pi-coding-agent";
+import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { getCapabilities, hyperlink, stripTerminalSequences, truncateToWidth, visibleWidth } from "@earendil-works/pi-tui";
 import { configuredOpenUri } from "@henryqw/pi-open-in/open-uri";
 
@@ -207,19 +207,6 @@ function latestResponse(ctx: ExtensionContext): { model: string; thinkingLevel?:
 	}
 }
 
-function codegraphBadge(status: string, inUse: boolean, theme: Theme): string {
-	if (inUse) return `${theme.fg("accent", "●")} CG`;
-	switch (status) {
-		case "pi-codegraph: indexed": return `${theme.fg("success", "✓")} CG`;
-		case "pi-codegraph: missing": return `${theme.fg("dim", "○")} CG`;
-		case "pi-codegraph: checking index…":
-		case "pi-codegraph: indexing…": return `${theme.fg("warning", "◐")} CG`;
-		case "pi-codegraph: prerequisites missing":
-		case "pi-codegraph: setup failed": return `${theme.fg("error", "!")} CG`;
-		default: return `${theme.fg("warning", "?")} CG`;
-	}
-}
-
 export default function footerExtension(pi: ExtensionAPI): void {
 	let activeMilliseconds = 0;
 	let activeStartedAt: number | undefined;
@@ -337,16 +324,20 @@ export default function footerExtension(pi: ExtensionAPI): void {
 		}
 
 		let tps: number | undefined;
-		// Start at the first streamed update: providers emit message_start at different points before the first token.
+		// Measure first to last streamed update: providers emit message_start before the first token,
+		// and some (Claude bridge) emit message_end only after post-stream teardown.
 		let assistantStartedAt: number | undefined;
+		let assistantLastUpdateAt: number | undefined;
 		pi.on("message_update", async (event) => {
-			if (event.message.role === "assistant") assistantStartedAt ??= performance.now();
+			if (event.message.role !== "assistant") return;
+			assistantLastUpdateAt = performance.now();
+			assistantStartedAt ??= assistantLastUpdateAt;
 		});
 		pi.on("message_end", async (event) => {
 			if (event.message.role !== "assistant") return;
 			const output = event.message.usage?.output ?? 0;
-			const seconds = assistantStartedAt === undefined ? 0 : (performance.now() - assistantStartedAt) / 1000;
-			assistantStartedAt = undefined;
+			const seconds = assistantStartedAt === undefined ? 0 : (assistantLastUpdateAt! - assistantStartedAt) / 1000;
+			assistantStartedAt = assistantLastUpdateAt = undefined;
 			tps = seconds > 0 ? output / seconds : undefined;
 		});
 
@@ -413,8 +404,9 @@ export default function footerExtension(pi: ExtensionAPI): void {
 					const openUri = configuredOpenUri(ctx.cwd);
 					const extensionStatuses = data.getExtensionStatuses();
 					const prStatus = sanitizeStatus(extensionStatuses.get("pi-pr") ?? "");
-					const codegraphStatus = extensionStatuses.get("pi-codegraph");
-					const codegraph = codegraphStatus === undefined ? "" : codegraphBadge(codegraphStatus, activeCodegraphCalls.size > 0, theme);
+					const codegraph = activeCodegraphCalls.size > 0
+						? `${theme.fg("accent", "●")} CG`
+						: sanitizeStatus(extensionStatuses.get("pi-codegraph") ?? "");
 					const henryStatuses: string[] = [];
 					const externalStatuses: string[] = [];
 					for (const [key, value] of [...extensionStatuses].sort(([a], [b]) => a.localeCompare(b))) {

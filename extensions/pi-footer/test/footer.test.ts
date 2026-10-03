@@ -247,7 +247,7 @@ test("shows the routed physical model under a virtual selection", async () => {
 	footer.dispose();
 });
 
-test("shows installed CodeGraph first and marks active calls without showing an absent install", async () => {
+test("preserves muted preparation statuses, clears completed work, and marks direct CodeGraph calls", async () => {
 	const { handlers, start } = setupFooter();
 	const factory = await start({
 		mode: "tui", cwd: "/repo", sessionManager: { getEntries: () => [] }, getContextUsage: () => undefined,
@@ -264,20 +264,18 @@ test("shows installed CodeGraph first and marks active calls without showing an 
 		colors.length = 0;
 		return stripTerminalSequences(footer.render(100)[2]!);
 	};
-	const expectBadge = (status: string, glyph: string, color: string) => {
-		statuses.set("pi-codegraph", status);
-		assert.ok(third().startsWith(`${glyph} CG · ↩ rewind `));
-		assert.deepEqual(colors.filter(([, text]) => "●✓○◐!?".includes(text)), [[color, glyph]]);
-		assert.ok(colors.every(([, text]) => !text.includes("CG")));
-	};
 	assert.match(third(), /^↩ rewind +◷ 0s$/);
-	expectBadge("pi-codegraph: missing", "○", "dim");
-	expectBadge("pi-codegraph: checking index…", "◐", "warning");
-	expectBadge("pi-codegraph: indexing…", "◐", "warning");
-	expectBadge("pi-codegraph: prerequisites missing", "!", "error");
-	expectBadge("pi-codegraph: setup failed", "!", "error");
-	expectBadge("pi-codegraph: unknown", "?", "warning");
-	expectBadge("pi-codegraph: indexed", "✓", "success");
+	statuses.set("pi-codegraph", "\x1b[2m⠋ codegraph · indexing 8s\x1b[22m");
+	statuses.set("pi-deps", "\x1b[2m⠙ deps · installing 12s\x1b[22m");
+	assert.match(third(), /^⠋ codegraph · indexing 8s · ⠙ deps · installing 12s · ↩ rewind +◷ 0s$/);
+	assert.match(footer.render(100)[2]!, /\x1b\[2m⠋ codegraph · indexing 8s\x1b\[22m/);
+	const failure = "\x1b[31m!\x1b[39m pi-codegraph: setup failed";
+	statuses.set("pi-codegraph", failure);
+	assert.ok(footer.render(100)[2]!.startsWith(failure));
+	assert.match(third(), /^! pi-codegraph: setup failed · /);
+	statuses.delete("pi-codegraph");
+	statuses.delete("pi-deps");
+	assert.match(third(), /^↩ rewind +◷ 0s$/);
 	await handlers.get("tool_execution_start")!({ toolCallId: "cg-1", toolName: "codegraph_explore", args: {} });
 	await handlers.get("tool_execution_start")!({ toolCallId: "other", toolName: "mcp", args: { server: "other", tool: "codegraph_explore" } });
 	assert.match(third(), /^● CG · ↩ rewind +◷ 0s$/);
@@ -285,7 +283,7 @@ test("shows installed CodeGraph first and marks active calls without showing an 
 	await handlers.get("tool_execution_end")!({ toolCallId: "other", toolName: "mcp" });
 	assert.match(third(), /^● CG · /);
 	await handlers.get("tool_execution_end")!({ toolCallId: "cg-1", toolName: "codegraph_explore" });
-	assert.match(third(), /^✓ CG · ↩ rewind +◷ 0s$/);
+	assert.match(third(), /^↩ rewind +◷ 0s$/);
 	assert.equal(renders, 2);
 	await handlers.get("session_shutdown")!(undefined);
 	footer.dispose();
@@ -401,13 +399,21 @@ test("shows TPS and active session time", async () => {
 		await handlers.get("message_update")!({ message: assistantMessage });
 		now = 6_000;
 		await handlers.get("message_update")!({ message: assistantMessage });
-		now = 7_000;
+		// Teardown after the last update (Claude bridge) must not count.
+		now = 9_000;
 		await handlers.get("message_end")!({ message: assistantMessage });
-		assert.match(footer.render(100)[1]!, /⚡ 50\.0 t\/s/);
+		assert.match(footer.render(100)[1]!, /⚡ 100\.0 t\/s/);
+
+		// A message delivered in one update has no measurable rate.
+		await handlers.get("message_update")!({ message: assistantMessage });
+		now = 10_000;
+		await handlers.get("message_end")!({ message: assistantMessage });
+		assert.match(footer.render(100)[1]!, /⚡ — /);
 
 		await handlers.get("message_end")!({ message: { role: "assistant", usage: { output: 10 } } });
 		assert.match(footer.render(100)[1]!, /⚡ — /);
 
+		now = 7_000;
 		await handlers.get("agent_start")!({ message: { role: "assistant" } }, { isIdle: () => false } as unknown as ExtensionContext);
 		now = 3_730_000;
 		assert.equal(footer.render(100)[2]!.trim(), "◷ 1h 2m 3s");
@@ -419,6 +425,7 @@ test("shows TPS and active session time", async () => {
 		const zeroOutput = { role: "assistant", usage: { output: 0 } };
 		await handlers.get("message_update")!({ message: zeroOutput });
 		now = 4_002_000;
+		await handlers.get("message_update")!({ message: zeroOutput });
 		await handlers.get("message_end")!({ message: zeroOutput });
 		assert.match(footer.render(100)[1]!, /⚡ 0\.0 t\/s/);
 	} finally {
