@@ -1,6 +1,10 @@
+import { mkdir } from "node:fs/promises";
+import { dirname, join } from "node:path";
+import { lock } from "proper-lockfile";
+import { Container, Key, matchesKey, SelectList, Text } from "@earendil-works/pi-tui";
 import { getSupportedThinkingLevels } from "@earendil-works/pi-ai";
-import { getAgentDir, type ExtensionAPI, type ExtensionContext } from "@earendil-works/pi-coding-agent";
-import { createConfigStore } from "@henryqw/pi-config-store";
+import { getAgentDir, getSelectListTheme, type ExtensionAPI, type ExtensionContext } from "@earendil-works/pi-coding-agent";
+import { createConfigStore, extensionConfigDir, readTextFileBoundedSync, writePrivateTextFileAtomically } from "@henryqw/pi-config-store";
 
 export const PROFILE_NAMES = ["fast", "balanced", "frontier", "fav"] as const;
 export type ProfileName = (typeof PROFILE_NAMES)[number];
@@ -239,7 +243,7 @@ export function resolveAvailableModel(
 }
 
 export function availableTaskModels(ctx: ExtensionContext): AvailableModel[] {
-	const scopedModels = ctx.scopedModels ?? [];
+	const scopedModels = ctx.scopedModels;
 	return dedupeAvailableModels(
 		(scopedModels.length ? scopedModels.map(({ model }) => model) : ctx.modelRegistry.getAvailable())
 			.filter((model) => model.input.includes("text")),
@@ -249,7 +253,7 @@ export function availableTaskModels(ctx: ExtensionContext): AvailableModel[] {
 
 export function taskThinkingLevels(ctx: ExtensionContext, model: AvailableModel): ThinkingLevel[] {
 	const supported = getSupportedThinkingLevels(model) as ThinkingLevel[];
-	const pinned = (ctx.scopedModels ?? []).find(({ model: scoped }) =>
+	const pinned = ctx.scopedModels.find(({ model: scoped }) =>
 		scoped.provider === model.provider && scoped.id === model.id)?.thinkingLevel;
 	if (!pinned) return supported;
 	return supported.includes(pinned as ThinkingLevel) ? [pinned as ThinkingLevel] : [];
@@ -423,6 +427,73 @@ function discoverModelTasks(pi: Pick<ExtensionAPI, "events">): ModelTask[] {
 	return [...tasks.values()].sort((left, right) => left.id.localeCompare(right.id));
 }
 
+function loadTaskModelPresets(path: string): Map<string, TaskModelsConfig["profiles"]> {
+	const value: unknown = JSON.parse(readTextFileBoundedSync(path, 64 * 1024));
+	if (!value || typeof value !== "object" || Array.isArray(value)) throw new Error("Presets must be an object.");
+	return new Map(Object.entries(value).map(([name, profiles]) => {
+		if (!isNonEmptyText(name)) throw new Error("Preset names must be non-empty text without surrounding whitespace or control characters.");
+		return [name, parseConfig({ profiles }).profiles];
+	}));
+}
+
+async function saveTaskModelPreset(ctx: ExtensionContext, path: string, profiles: TaskModelsConfig["profiles"]): Promise<void> {
+	if (!Object.keys(profiles).length) {
+		ctx.ui.notify("Configure a task model profile before saving a preset.", "warning");
+		return;
+	}
+	const name = await ctx.ui.input("Save task model preset", "Preset name");
+	if (name === undefined) return;
+	if (!isNonEmptyText(name)) {
+		ctx.ui.notify("Preset names must be non-empty text without surrounding whitespace or control characters.", "error");
+		return;
+	}
+	try {
+		await mkdir(dirname(path), { recursive: true, mode: 0o700 });
+		const release = await lock(path, { realpath: false, retries: 0 });
+		try {
+			let presets: ReturnType<typeof loadTaskModelPresets>;
+			try {
+				presets = loadTaskModelPresets(path);
+			} catch (error) {
+				if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+				presets = new Map();
+			}
+			if (presets.has(name) && !await ctx.ui.confirm("Replace task model preset?", `Replace "${name}" with the current profiles?`)) return;
+			presets.set(name, profiles);
+			const contents = `${JSON.stringify(Object.fromEntries(presets), null, 2)}\n`;
+			if (Buffer.byteLength(contents, "utf8") > 64 * 1024) throw new Error("Presets exceed 65536 bytes.");
+			await writePrivateTextFileAtomically(path, contents);
+		} finally {
+			await release();
+		}
+	} catch (error) {
+		const message = error instanceof SyntaxError ? "Invalid JSON." : error instanceof Error ? error.message : String(error);
+		ctx.ui.notify(`Couldn't save task model presets at ${path}: ${message}`, "error");
+		return;
+	}
+	ctx.ui.notify(`Saved task model preset: ${name}.`, "info");
+}
+
+async function selectTaskModels(ctx: ExtensionContext, options: string[]): Promise<string | undefined> {
+	if (ctx.mode !== "tui") return ctx.ui.select("Task models", options);
+	return ctx.ui.custom<string | undefined>((tui, theme, _keybindings, done) => {
+		const container = new Container();
+		container.addChild(new Text(theme.fg("accent", "Task models"), 1, 1));
+		const list = new SelectList(options.map((label) => ({ value: label, label })), 10, getSelectListTheme());
+		list.onSelect = (item) => done(item.value);
+		list.onCancel = () => done(undefined);
+		container.addChild(list);
+		container.addChild(new Text(theme.fg("dim", "Option+S / Alt+S: save current profiles as a preset"), 1, 1));
+		return Object.assign(container, {
+			handleInput(data: string) {
+				if (matchesKey(data, Key.alt("s"))) done("save-preset");
+				else list.handleInput(data);
+				tui.requestRender();
+			},
+		});
+	});
+}
+
 export function createTaskModelsExtension(
 	pi: ExtensionAPI,
 	options?: { agentDir?: string },
@@ -435,8 +506,13 @@ export function createTaskModelsExtension(
 		}
 	});
 	pi.registerCommand("task-models", {
-		description: "configure shared task model profiles",
-		handler: async (_args, ctx) => {
+		description: "configure shared task model profiles; choose a saved setup with /task-models preset",
+		handler: async (args, ctx) => {
+			const action = args.trim();
+			if (action && action !== "preset") {
+				ctx.ui.notify("Usage: /task-models [preset]", "error");
+				return;
+			}
 			let config: TaskModelsConfig;
 			try {
 				config = configStore.loadSync().value;
@@ -444,6 +520,43 @@ export function createTaskModelsExtension(
 				ctx.ui.notify("Couldn't read task model config.", "error");
 				return;
 			}
+
+			if (action === "preset") {
+				const path = join(extensionConfigDir("pi-task-models", agentDir), "presets.json");
+				let presets: ReturnType<typeof loadTaskModelPresets>;
+				try {
+					presets = loadTaskModelPresets(path);
+				} catch (error) {
+					const message = error instanceof SyntaxError ? "Invalid JSON." : error instanceof Error ? error.message : String(error);
+					ctx.ui.notify(`Couldn't read task model presets at ${path}: ${message}`, "error");
+					return;
+				}
+				if (!presets.size) {
+					ctx.ui.notify(`No presets found in ${path}.`, "info");
+					return;
+				}
+				const selected = await ctx.ui.select("Task model preset", [...presets.keys()].sort());
+				if (!selected) return;
+				const profiles = presets.get(selected)!;
+				try {
+					await configStore.update((current) => ({ ...current, profiles: { ...current.profiles, ...profiles } }));
+				} catch {
+					ctx.ui.notify("Couldn't save task model config.", "error");
+					return;
+				}
+				ctx.ui.notify(`Applied task model preset: ${selected}.`, "info");
+				return;
+			}
+
+			const save = async (): Promise<boolean> => {
+				try {
+					await configStore.save(config);
+					return true;
+				} catch {
+					ctx.ui.notify("Couldn't save task model config.", "error");
+					return false;
+				}
+			};
 
 			const profileOptions = PROFILE_NAMES.map((name) => {
 				const configured = config.profiles[name];
@@ -454,24 +567,19 @@ export function createTaskModelsExtension(
 						: `${name} · not configured`,
 				};
 			});
-			const save = async (): Promise<boolean> => {
-				try {
-					await configStore.save(config);
-					return true;
-				} catch {
-					ctx.ui.notify("Couldn't save task model config.", "error");
-					return false;
-				}
-			};
 			const taskOptions = discoverModelTasks(pi).map((task) => {
 				const profile = config.tasks[task.id] ?? task.defaultProfile;
 				return { task, label: `${task.label} · ${task.id} · ${profile}` };
 			});
-			const selected = await ctx.ui.select("Task models", [
+			const selected = await selectTaskModels(ctx, [
 				...profileOptions.map(({ label }) => label),
 				...taskOptions.map(({ label }) => label),
 			]);
 			if (!selected) return;
+			if (selected === "save-preset") {
+				await saveTaskModelPreset(ctx, join(extensionConfigDir("pi-task-models", agentDir), "presets.json"), config.profiles);
+				return;
+			}
 
 			const task = taskOptions.find(({ label }) => label === selected)?.task;
 			if (task) {

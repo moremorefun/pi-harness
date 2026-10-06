@@ -1,6 +1,18 @@
 import assert from "node:assert/strict";
 import { after, before, test } from "node:test";
+import { fileURLToPath } from "node:url";
+import { execFileSync } from "node:child_process";
+import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { spawnBounded, type Exec as BoundedExec } from "@henryqw/pi-process";
+import { PullRequestCommentSweep, StaleSweepStart } from "../extensions/pr-comment-sweep.ts";
+import { PullRequestBranchUpdater } from "../extensions/pr-update-branch.ts";
+import { PullRequestCiFixer, StaleCiCollect } from "../extensions/pr-ci.ts";
+import { PullRequestWorkPublisher } from "../extensions/pr-publish-work.ts";
+import { DEFAULT_PR_POLICY, type PrPolicy } from "../extensions/pr-run.ts";
 import type {
+	AgentBeforeSettleEventResult,
 	ExecOptions,
 	ExecResult,
 	ExtensionAPI,
@@ -25,7 +37,7 @@ type Loader = (
 	inspectedLocal?: unknown,
 	observation?: unknown,
 ) => Promise<CurrentPullRequest | CurrentPullRequestDiscovery | null>;
-type EventHandler = (event: unknown, context: ExtensionContext) => Promise<void> | void;
+type EventHandler = (event: unknown, context: ExtensionContext) => Promise<AgentBeforeSettleEventResult | void> | AgentBeforeSettleEventResult | void;
 type Command = Parameters<ExtensionAPI["registerCommand"]>[1];
 type Tool = Parameters<ExtensionAPI["registerTool"]>[0];
 type ExtensionDependencies = NonNullable<Parameters<typeof pullRequestExtension>[1]>;
@@ -99,7 +111,7 @@ function currentPullRequest(overrides: {
 			unresolvedThreads: 0,
 			ci: "none",
 			review: "ready",
-			policy: "ready",
+			policy: "ready", mergeability: "known",
 			...overrides.conditions,
 		},
 		local: { worktree: "clean", head: "equal" },
@@ -182,9 +194,12 @@ function harness(options: {
 	inspectSweepRecovery?: ExtensionDependencies["inspectSweepRecovery"];
 	inspectBranchRecovery?: ExtensionDependencies["inspectBranchRecovery"];
 	createCiFixer?: ExtensionDependencies["createCiFixer"];
+	createWorkPublisher?: ExtensionDependencies["createWorkPublisher"];
+	syncLocalHead?: ExtensionDependencies["syncLocalHead"];
+	policy?: Partial<PrPolicy>;
 	isIdle?: () => boolean;
+	skillPath?: string;
 }) {
-	let beforeAgentStart: EventHandler | undefined;
 	let sessionStart: EventHandler | undefined;
 	let sessionShutdown: EventHandler | undefined;
 	let agentSettled: EventHandler | undefined;
@@ -222,6 +237,9 @@ function harness(options: {
 		inspectSweepRecovery: options.inspectSweepRecovery ?? (async () => false),
 		inspectBranchRecovery: options.inspectBranchRecovery ?? (async () => false),
 		createCiFixer: options.createCiFixer,
+		createWorkPublisher: options.createWorkPublisher,
+		syncLocalHead: options.syncLocalHead,
+		loadPrPolicy: () => ({ ...DEFAULT_PR_POLICY, ciWaitMinutes: 0, ...options.policy }),
 		needsFeedbackAttention: async () => false,
 	};
 	if (!options.useDefaultCommandHandler) {
@@ -230,7 +248,6 @@ function harness(options: {
 
 	pullRequestExtension({
 		on(event: string, handler: unknown) {
-			if (event === "before_agent_start") beforeAgentStart = handler as EventHandler;
 			if (event === "session_start") sessionStart = handler as EventHandler;
 			if (event === "session_shutdown") sessionShutdown = handler as EventHandler;
 			if (event === "agent_settled") agentSettled = handler as EventHandler;
@@ -250,7 +267,9 @@ function harness(options: {
 				"skill:pi-pr-update-branch",
 				"skill:pi-pr-comment-sweep",
 				"skill:pi-pr-fix-ci",
-			].map((name) => ({ name, source: "skill", sourceInfo: { origin: "package" } }));
+			].map((name) => ({ name, source: "skill", sourceInfo: {
+				origin: "package", path: options.skillPath ?? fileURLToPath(new URL(`../skills/${name.slice("skill:".length)}/SKILL.md`, import.meta.url)),
+			} }));
 		},
 		sendUserMessage(content: string) {
 			messages.push(content);
@@ -302,11 +321,8 @@ function harness(options: {
 		async shutdown(ctx: ExtensionContext): Promise<void> {
 			await handler(sessionShutdown, "session_shutdown")({} as never, callbackContext(ctx));
 		},
-		async beforeStart(prompt: string, ctx: ExtensionContext): Promise<void> {
-			await handler(beforeAgentStart, "before_agent_start")({ prompt } as never, callbackContext(ctx));
-		},
-		async beforeSettle(ctx: ExtensionContext, outcome = "completed"): Promise<void> {
-			await handler(agentBeforeSettle, "agent_before_settle")({ outcome, context: { canContinue: false } } as never, callbackContext(ctx));
+		async beforeSettle(ctx: ExtensionContext, outcome = "completed") {
+			return await handler(agentBeforeSettle, "agent_before_settle")({ outcome, entries: [], context: { canContinue: false } } as never, callbackContext(ctx));
 		},
 		async settle(ctx: ExtensionContext): Promise<void> {
 			await handler(agentSettled, "agent_settled")({} as never, callbackContext(ctx));
@@ -340,19 +356,21 @@ function harness(options: {
 	};
 }
 
-test("registers sequential tools with flat object roots and strict actions", async () => {
+test("registers sequential model-only tools with flat object roots and strict actions", async () => {
 	const app = harness({ async load() { return { kind: "inactive" }; } });
 	const expected = new Map([
 		["pi_pr_update_branch", ["rebase", "continue", "publish"]],
 		["pi_pr_create", ["prepare", "inspect", "commit", "verify", "push", "publish"]],
 		["pi_pr_publish_work", ["inspect", "commit", "validate", "publish"]],
-		["pi_pr_sweep", ["start", "resume", "show", "record", "commit", "publish", "refresh", "resolve", "finalize"]],
+		["pi_pr_sweep", ["start", "resume", "show", "record", "commit", "adopt", "validate", "publish", "refresh", "resolve", "finalize"]],
 		["pi_pr_fix_ci", ["collect", "publish"]],
 	]);
 
 	assert.deepEqual(app.tools.map(({ name }) => name), [...expected.keys()]);
 	for (const tool of app.tools) {
 		assert.equal(tool.executionMode, "sequential", tool.name);
+		// Codemode scripts must not batch guarded actions or filter their results; `only` mode keeps model-only tools declared.
+		assert.equal(tool.exposure, "model-only", tool.name);
 		// Strict OpenAI-compatible endpoints reject a root without type "object"; Claude Code drops a root union.
 		const schema = tool.parameters as unknown as {
 			type?: string;
@@ -380,7 +398,299 @@ test("registers sequential tools with flat object roots and strict actions", asy
 	}
 });
 
-test("one /pr continues from a final answer through queued workflows without before_agent_start until external CI", async () => {
+for (const [route, drift] of [
+	["update-branch", "local"], ["sweep", "local"], ["fix-ci", "local"],
+	["update-branch", "published"], ["update-branch", "base"], ["update-branch", "conflict"],
+	["update-branch", "rediscovery-head"], ["update-branch", "abort"], ["update-branch", "tool-abort"],
+] as const) test(`queued ${route} replans ${drift} drift in the same /pr`, async (t) => {
+	const dir = mkdtempSync(join(tmpdir(), "pi-pr-stale-route-"));
+	t.after(() => rmSync(dir, { recursive: true, force: true }));
+	const root = join(dir, "worktree");
+	const bare = join(dir, "remote.git");
+	const git = (...args: string[]) => execFileSync("git", args, { cwd: root, encoding: "utf8", stdio: ["ignore", "pipe", "pipe"] }).trim();
+	execFileSync("git", ["init", "--bare", bare], { stdio: "ignore" });
+	execFileSync("git", ["init", "--initial-branch=main", root], { stdio: "ignore" });
+	git("config", "user.name", "Stale Route Test");
+	git("config", "user.email", "stale@example.test");
+	writeFileSync(join(root, "file.txt"), "original\n");
+	git("add", "file.txt");
+	git("commit", "-m", "initial");
+	git("switch", "-c", "feature/pr");
+	writeFileSync(join(root, "feature.txt"), "feature\n");
+	git("add", "feature.txt");
+	git("commit", "-m", "feature");
+	const original = git("rev-parse", "HEAD");
+	const destination = "git@github.com:acme/project.git";
+	git("remote", "add", "origin", destination);
+	git("push", bare, `${original}:refs/heads/feature/pr`);
+	git("switch", "main");
+	writeFileSync(join(root, "base.txt"), "base\n");
+	git("add", "base.txt");
+	git("commit", "-m", "base");
+	const base = git("rev-parse", "HEAD");
+	git("switch", "feature/pr");
+	let authority = currentPullRequest({ conditions: { conflict: route === "update-branch", changesRequested: route === "sweep", ci: route === "fix-ci" ? "failure" : "success" } });
+	authority = { ...authority, base: { ...authority.base, oid: base }, head: { ...authority.head, oid: original },
+		target: { ...authority.target, remoteOid: original } };
+	const pushes: string[][] = [];
+	const ciAuthorities: string[] = [];
+	const reservations: Array<{ run: unknown; head: string; base: string; lease: string | null }> = [];
+	const exec: BoundedExec = async (command, args, options) => {
+		assert.equal(args.includes("rebase"), false, "the existing merge must never be rebased");
+		if (command === "gh" && args[0] === "repo") return execResult(JSON.stringify({ nameWithOwner: "acme/project", url: "https://github.com/acme/project" }));
+		if (command === "gh" && args[0] === "api") {
+			assert.equal(/\/check-runs|\/actions\//.test(args.at(-1) ?? ""), false, "stale CI must cancel before reading evidence");
+			const empty = { nodes: [], pageInfo: { hasNextPage: false, endCursor: null } };
+			return execResult(JSON.stringify({ data: { repository: { pullRequest: { comments: empty, reviews: empty, reviewThreads: empty } } } }));
+		}
+		if (command === "git" && ["push", "ls-remote"].includes(args[0]!)) {
+			if (args[0] === "push") pushes.push([...args]);
+			args = args.map((arg) => arg === destination ? bare : arg);
+		}
+		return await spawnBounded(command, args, options);
+	};
+	const ids = [routeRunId, "22222222-2222-4222-8222-222222222222", "33333333-3333-4333-8333-333333333333"];
+	let run = 0;
+	let abortDiscovery: AbortController | undefined;
+	const app = harness({
+		async load() {
+			abortDiscovery?.abort(new Error("tool cancelled during authority read"));
+			const remoteHead = git("ls-remote", bare, "refs/heads/feature/pr").split("\t")[0]!;
+			return { ...authority, head: { ...authority.head, oid: remoteHead }, target: { ...authority.target, remoteOid: remoteHead },
+				local: { worktree: "clean", head: git("rev-parse", "HEAD") === remoteHead ? "equal" : "ahead" } };
+		},
+		useDefaultCommandHandler: true, isIdle: () => false, newRunId: () => ids[run++]!,
+		async canonicalWorktree() { return root; },
+		createBranchUpdater: (options) => {
+			reservations.push({ run: options.run, head: options.authority.head.oid, base: options.authority.base.oid, lease: options.authority.target.remoteOid });
+			return new PullRequestBranchUpdater({ ...options, exec, agentDir: join(dir, "agent") });
+		},
+		createCommentSweep: (options) => new PullRequestCommentSweep({ ...options, exec, agentDir: join(dir, "agent") }),
+		createWorkPublisher: (options) => new PullRequestWorkPublisher({ ...options, exec, agentDir: join(dir, "agent") }),
+		createCiFixer: (options) => {
+			reservations.push({ run: options.run, head: options.authority.head.oid, base: options.authority.base.oid, lease: options.authority.target.remoteOid });
+			ciAuthorities.push(options.authority.head.oid);
+			return new PullRequestCiFixer({ ...options, exec, agentDir: join(dir, "agent") });
+		},
+	});
+	const ctx = app.context();
+	try {
+		await app.start(ctx);
+		await app.command().handler("", ctx as ExtensionCommandContext);
+		if (drift === "base") {
+			git("switch", "main");
+			git("commit", "--allow-empty", "-m", "advance base");
+			authority.base = { ...authority.base, oid: git("rev-parse", "HEAD") };
+			git("switch", "feature/pr");
+		} else if (drift !== "conflict") git("merge", "--no-ff", "main", "-m", "merge main locally");
+		const merged = git("rev-parse", "HEAD");
+		if (drift !== "local" && drift !== "base") {
+			if (drift !== "conflict") git("push", bare, `${merged}:refs/heads/feature/pr`);
+			authority.conditions = { ...authority.conditions, conflict: false, ci: "failure" };
+		}
+		const queued = await app.beforeSettle(ctx);
+		const tool = route === "fix-ci" ? "pi_pr_fix_ci" : route === "sweep" ? "pi_pr_sweep" : "pi_pr_update_branch";
+		const action = route === "fix-ci" ? "collect" : route === "sweep" ? "start" : "rebase";
+		assert.match(JSON.stringify(queued), route === "fix-ci" ? /pi-pr-fix-ci/ : route === "sweep" ? /pi-pr-comment-sweep/ : /pi-pr-update-branch/);
+		if (drift === "tool-abort") {
+			abortDiscovery = new AbortController();
+			await assert.rejects(app.callTool(tool, { runId: ids[0], action }, ctx, abortDiscovery.signal), /abort|cancel/i);
+			assert.equal(await app.beforeSettle(ctx), undefined);
+			assert.equal(reservations.length, 1);
+			assert.deepEqual(pushes, []);
+			return;
+		}
+		const stale = (await app.callTool(tool, { runId: ids[0], action }, ctx)).details;
+		if (drift === "local") assert.deepEqual(stale,
+			{ kind: "stale", reason: `Local HEAD is ahead of the frozen PR head; cancelled before ${route === "fix-ci" ? "CI evidence" : route === "sweep" ? "sweep recovery" : "rebase"} or publication`,
+				...(route === "update-branch" ? { authority: { ...authority, local: { worktree: "clean", head: "ahead" } } } : {}) });
+		else {
+			assert.equal((stale as { kind: string }).kind, "stale");
+			assert.match((stale as { reason: string }).reason, drift === "base" ? /Base OID changed/ : drift === "conflict" ? /PR conflict cleared/ : /Published PR head advanced by fast-forward/);
+		}
+		assert.deepEqual(pushes, [], "stale detection never publishes");
+		await assert.rejects(app.callTool(tool, { runId: ids[0], action }, ctx), /cancelled/);
+		if (drift === "rediscovery-head") {
+			git("commit", "--allow-empty", "-m", "another external publication");
+			git("push", bare, "HEAD:refs/heads/feature/pr");
+		}
+		if (drift === "abort") ctx.signal = AbortSignal.abort(new Error("cancel stale handoff"));
+		const next = await app.beforeSettle(ctx);
+		if (drift === "rediscovery-head" || drift === "abort") {
+			assert.equal(next, undefined);
+			assert.equal(reservations.length, 1);
+			assert.match(app.notifications.at(-1)!.message, drift === "abort" ? /cancel stale handoff/ : /remote head changed/);
+			return;
+		}
+		if (drift !== "local") {
+			assert.equal(next?.continue, true);
+			assert.match(JSON.stringify(next), drift === "base" ? /pi-pr-update-branch/ : /pi-pr-fix-ci/);
+			assert.equal(reservations.length, 2);
+			assert.equal(reservations[1]!.run, reservations[0]!.run, "rediscovery keeps the invocation budgets");
+			assert.equal(reservations[1]!.head, merged);
+			assert.equal(reservations[1]!.lease, merged);
+			assert.equal(reservations[1]!.base, authority.base.oid);
+			await assert.rejects(app.callTool(tool, { runId: ids[0], action }, ctx), /wrong or stale/);
+			assert.equal(git("rev-parse", "HEAD"), merged);
+			assert.deepEqual(pushes, []);
+			return;
+		}
+		assert.equal(next?.continue, true);
+		assert.match(JSON.stringify(next), /pi-pr-publish-work/);
+		await assert.rejects(app.callTool(tool, { runId: ids[0], action }, ctx), /wrong or stale/);
+		assert.deepEqual((await app.callTool("pi_pr_publish_work", { runId: ids[1], action: "inspect" }, ctx)).details, { paths: [], head: merged, originalHead: original, diverged: false });
+		await assert.rejects(app.callTool("pi_pr_publish_work", { runId: ids[1], action: "publish" }, ctx), /not validated/);
+		await app.callTool("pi_pr_publish_work", { runId: ids[1], action: "validate", checks: [] }, ctx);
+		await app.callTool("pi_pr_publish_work", { runId: ids[1], action: "publish" }, ctx);
+		assert.deepEqual(pushes, [["push", "--porcelain", `--force-with-lease=refs/heads/feature/pr:${original}`,
+			"--recurse-submodules=no", "--", destination, `${merged}:refs/heads/feature/pr`]]);
+		assert.equal(git("ls-remote", bare, "refs/heads/feature/pr").split("\t")[0], merged);
+		assert.equal(git("rev-parse", "HEAD"), merged);
+		assert.deepEqual(app.messages, []);
+		assert.match(app.notifications[0]!.message, /cancelled.*rediscovering \(1\/2\)/);
+		if (route === "fix-ci") {
+			const resumed = await app.beforeSettle(ctx);
+			assert.equal(resumed?.continue, true);
+			assert.match(JSON.stringify(resumed), /pi-pr-fix-ci/);
+			assert.ok(JSON.stringify(resumed).includes(`runId=${ids[2]} action=collect`));
+			assert.deepEqual(ciAuthorities, [original, merged]);
+			await assert.rejects(app.callTool(tool, { runId: ids[0], action }, ctx), /wrong or stale/);
+		}
+		if (route === "sweep") {
+			const resumed = await app.beforeSettle(ctx);
+			assert.equal(resumed?.continue, true);
+			assert.match(JSON.stringify(resumed), /pi-pr-comment-sweep/);
+			const started = await app.callTool("pi_pr_sweep", { runId: ids[2], action: "start" }, ctx);
+			assert.equal((started.details as { phase: string }).phase, "triage");
+			assert.equal((started.details as { originalHead: string }).originalHead, merged);
+		}
+	} finally { await app.shutdown(ctx); }
+});
+
+for (const route of ["update-branch", "sweep", "fix-ci"] as const)
+for (const drift of ["identity", "lease", "destination", "worktree", "failure", "recovery"] as const) test(`${route} stale-route continuation stops for ${drift} drift`, async () => {
+	let stale = false;
+	let loads = 0;
+	const pr = currentPullRequest({ conditions: { conflict: route === "update-branch", changesRequested: route === "sweep", ci: route === "fix-ci" ? "failure" : "success" } });
+	const app = harness({
+		async load() {
+			loads++;
+			if (!stale) return pr;
+			const fresh = { ...pr, local: { ...pr.local, head: "ahead" as const } };
+			if (drift === "identity") fresh.id = "PR_unrelated";
+			if (drift === "lease") fresh.head = { ...pr.head, oid: "c".repeat(40) };
+			if (drift === "destination") fresh.target = { ...pr.target, ref: "other" };
+			return fresh;
+		},
+		useDefaultCommandHandler: true, isIdle: () => false, newRunId: () => routeRunId,
+		async canonicalWorktree() { return stale && drift === "worktree" ? "/other" : "/repo"; },
+		inspectBranchRecovery: async () => { if (stale && drift === "recovery") throw new Error("rebase outcome is unverified; do not replay it"); return false; },
+		createBranchUpdater: () => ({ state: { phase: "ready" }, async recoveryLaunchAction() { return "rebase"; },
+			async rebase() { if (drift === "failure") throw new Error("git rebase was killed; its outcome is unknown"); return { kind: "stale", reason: "HEAD mismatch before mutation", authority: pr }; } }) as never,
+		createCommentSweep: () => ({ async recoveryLaunchAction() { return "start"; }, async start() {
+			if (drift === "failure") throw new Error("feedback fetch failed");
+			throw new StaleSweepStart("HEAD mismatch before mutation");
+		} }) as never,
+		createCiFixer: () => ({ async collect() {
+			if (drift === "failure") throw new Error("CI evidence read failed");
+			throw new StaleCiCollect("HEAD mismatch before evidence");
+		} }) as never,
+		createWorkPublisher: () => { throw new Error("must not authorize publication"); },
+	});
+	const ctx = app.context();
+	try {
+		await app.start(ctx);
+		await app.command().handler("", ctx as ExtensionCommandContext);
+		await app.beforeSettle(ctx);
+		const tool = route === "fix-ci" ? "pi_pr_fix_ci" : route === "sweep" ? "pi_pr_sweep" : "pi_pr_update_branch";
+		const params = { runId: routeRunId, action: route === "fix-ci" ? "collect" : route === "sweep" ? "start" : "rebase" };
+		if (drift === "failure") {
+			await assert.rejects(app.callTool(tool, params, ctx), /outcome is unknown|feedback fetch failed|CI evidence read failed/);
+		} else await app.callTool(tool, params, ctx);
+		stale = true;
+		const before = loads;
+		assert.equal(await app.beforeSettle(ctx), undefined);
+		assert.equal(loads, before + (["worktree", "failure"].includes(drift) ? 0 : 1));
+		if (drift !== "failure") assert.match(app.notifications.at(-1)!.message, /continuation stopped/);
+	} finally { await app.shutdown(ctx); }
+});
+
+for (const routes of [
+	["update-branch", "update-branch", "update-branch"], ["sweep", "sweep", "sweep"],
+	["fix-ci", "fix-ci", "fix-ci"], ["fix-ci", "sweep", "update-branch"],
+] as const) test(`${routes.join(" → ")} pre-mutation drift shares only two fresh rediscoveries`, async () => {
+	let runs = 0;
+	let loads = 0;
+	const ids = [1, 2, 3].map((n) => `${String(n).repeat(8)}-1111-4111-8111-111111111111`);
+	const app = harness({
+		async load() { loads++; const route = routes[Math.min(runs, 2)]; return currentPullRequest({ conditions: { conflict: route === "update-branch", changesRequested: route === "sweep", ci: route === "fix-ci" ? "failure" : "success" } }); },
+		useDefaultCommandHandler: true, isIdle: () => false, newRunId: () => ids[runs++]!,
+		async canonicalWorktree() { return "/repo"; },
+		createBranchUpdater: (options) => ({ state: { phase: "ready" }, async recoveryLaunchAction() { return "rebase"; },
+			async rebase() { return { kind: "stale", reason: "local HEAD advanced before rebase, then restored", authority: options.authority }; } }) as never,
+		createCommentSweep: () => ({ async recoveryLaunchAction() { return "start"; },
+			async start() { throw new StaleSweepStart("local HEAD advanced before triage, then restored"); } }) as never,
+		createCiFixer: () => ({ async collect() { throw new StaleCiCollect("local HEAD advanced before evidence, then restored"); } }) as never,
+	});
+	const ctx = app.context();
+	try {
+		await app.start(ctx);
+		await app.command().handler("", ctx as ExtensionCommandContext);
+		await app.beforeSettle(ctx);
+		for (let n = 0; n < 3; n++) {
+			const route = routes[n];
+			const tool = route === "fix-ci" ? "pi_pr_fix_ci" : route === "sweep" ? "pi_pr_sweep" : "pi_pr_update_branch";
+			const action = route === "fix-ci" ? "collect" : route === "sweep" ? "start" : "rebase";
+			await app.callTool(tool, { runId: ids[n], action }, ctx);
+			const before = loads;
+			const next = await app.beforeSettle(ctx);
+			assert.equal(next?.continue, n < 2 ? true : undefined);
+			assert.equal(loads, before + (n < 2 ? 1 : 0));
+		}
+		assert.equal(runs, 3);
+		assert.match(app.notifications.at(-1)!.message, /rediscovery limit exhausted/);
+		await assert.rejects(app.callTool("pi_pr_fix_ci", { runId: ids[0], action: "collect" }, ctx), /No PR workflow/);
+	} finally { await app.shutdown(ctx); }
+});
+
+test("dirty diverged work is committed, synced onto the PR head, and published in one /pr", async () => {
+	const ids = [1, 2].map((n) => `${String(n).repeat(8)}-1111-4111-8111-111111111111`);
+	const locals: Array<CurrentPullRequest["local"]> = [
+		{ worktree: "dirty", head: "diverged" }, { worktree: "clean", head: "diverged" }, { worktree: "clean", head: "ahead" },
+	];
+	let loads = 0;
+	let runs = 0;
+	const syncs: string[] = [];
+	const committed = "c".repeat(40);
+	const app = harness({
+		async load() { return { ...currentPullRequest(), local: locals[Math.min(loads++, locals.length - 1)]! }; },
+		useDefaultCommandHandler: true, newRunId: () => ids[runs++]!,
+		async canonicalWorktree() { return "/repo"; },
+		createWorkPublisher: () => ({
+			async inspect() { return { paths: ["file.ts"], head: "d".repeat(40), originalHead: "b".repeat(40), diverged: true }; },
+			async commit() { return { head: committed, diverged: true }; },
+			async validate() { throw new Error("validate must wait for the synced HEAD"); },
+		}) as never,
+		async syncLocalHead({ authority }) { syncs.push(authority.head.oid); return { kind: "rebased", head: "e".repeat(40) }; },
+	});
+	const ctx = app.context();
+	try {
+		await app.start(ctx);
+		await app.command().handler("", ctx as ExtensionCommandContext);
+		assert.deepEqual(app.messages, [`/skill:pi-pr-publish-work runId=${ids[0]} action=inspect`]);
+		assert.deepEqual((await app.callTool("pi_pr_publish_work", { runId: ids[0], action: "commit", ownedPaths: ["file.ts"], message: "fix: scoped" }, ctx)).details,
+			{ head: committed, diverged: true });
+		await assert.rejects(app.callTool("pi_pr_publish_work", { runId: ids[0], action: "validate", checks: [] }, ctx), /cancelled; fresh routing is pending/);
+		await app.beforeSettle(ctx);
+		assert.deepEqual(syncs, ["b".repeat(40)]);
+		assert.equal(app.messages.length, 2, "the synced branch is published in the same invocation");
+		assert.deepEqual(app.messages.at(-1), `/skill:pi-pr-publish-work runId=${ids[1]} action=inspect`);
+		assert.ok(app.notifications.some(({ message }) => /syncing before publication; rediscovering \(1\/2\)/.test(message)));
+		assert.ok(app.notifications.some(({ message }) => /local branch rebased onto the PR head/.test(message)));
+	} finally { await app.shutdown(ctx); }
+});
+
+test("one /pr continues from a final answer through hidden boundaries until external CI", async () => {
 	let stage = 0;
 	let run = 0;
 	const ids = [1, 2, 3, 4].map((n) => `${String(n).repeat(8)}-1111-4111-8111-111111111111`);
@@ -418,6 +728,7 @@ test("one /pr continues from a final answer through queued workflows without bef
 	try {
 		await app.start(ctx);
 		await app.command().handler("", ctx as ExtensionCommandContext);
+		const boundaryPrompts: string[] = [];
 		for (const [tool, args] of [
 			["pi_pr_create", { action: "publish", title: "fix", body: "Summary" }],
 			["pi_pr_update_branch", { action: "publish" }],
@@ -425,11 +736,18 @@ test("one /pr continues from a final answer through queued workflows without bef
 			["pi_pr_sweep", { action: "finalize", guard: { epoch: 1, runId: "run", generation: 1, fingerprint: "a".repeat(64) }, checks: [] }],
 		] as const) {
 			await app.callTool(tool, { runId: ids[stage], ...args }, ctx);
-			await app.beforeSettle(ctx);
+			const result = await app.beforeSettle(ctx);
+			if (result) {
+				assert.equal(result.continue, true);
+				const entry = result.entries![0]!;
+				assert.equal(entry.type, "custom_message");
+				if (entry.type === "custom_message") { assert.equal(entry.display, false); boundaryPrompts.push(String(entry.content)); }
+			}
 		}
 		assert.equal(stage, 4);
-		assert.deepEqual(app.messages.map((message) => message.match(/skill:pi-pr-[^ ]+/)?.[0]),
-			["skill:pi-pr-create", "skill:pi-pr-update-branch", "skill:pi-pr-fix-ci", "skill:pi-pr-comment-sweep"]);
+		assert.deepEqual(app.messages, [`/skill:pi-pr-create runId=${ids[0]} action=prepare`]);
+		assert.deepEqual(boundaryPrompts.map((prompt) => prompt.match(/name="([^"]+)"/)?.[1]),
+			["pi-pr-update-branch", "pi-pr-fix-ci", "pi-pr-comment-sweep"]);
 		assert.match(app.notifications.at(-1)!.message, /waiting for CI/);
 	} finally { await app.shutdown(ctx); }
 });
@@ -704,8 +1022,8 @@ test("releases a stale reservation when replacement wins before dispatch resumes
 	}
 });
 
-test("session replacement aborts an in-flight workflow helper", async () => {
-	const authority = currentPullRequest({ conditions: { conflict: true } });
+for (const route of ["update-branch", "fix-ci"] as const) test(`session replacement aborts an in-flight ${route} helper`, async () => {
+	const authority = currentPullRequest({ conditions: { conflict: route === "update-branch", ci: route === "fix-ci" ? "failure" : "success" } });
 	const actionStarted = deferred<void>();
 	let helperSignal: AbortSignal | undefined;
 	const state = {
@@ -717,6 +1035,12 @@ test("session replacement aborts an in-flight workflow helper", async () => {
 		useDefaultCommandHandler: true,
 		newRunId: () => routeRunId,
 		async canonicalWorktree() { return "/canonical/repo"; },
+		createCiFixer(options) {
+			const signal = options.signal;
+			assert.ok(signal);
+			helperSignal = signal;
+			return { async collect() { actionStarted.resolve(); return await waitForAbort(signal); } } as never;
+		},
 		createBranchUpdater(options) {
 			const signal = options.signal;
 			assert.ok(signal);
@@ -737,7 +1061,7 @@ test("session replacement aborts an in-flight workflow helper", async () => {
 	try {
 		await app.start(first);
 		await app.command().handler("", first as ExtensionCommandContext);
-		const action = app.callTool("pi_pr_update_branch", { runId: routeRunId, action: "rebase" }, first);
+		const action = app.callTool(route === "fix-ci" ? "pi_pr_fix_ci" : "pi_pr_update_branch", { runId: routeRunId, action: route === "fix-ci" ? "collect" : "rebase" }, first);
 		const cancelled = assert.rejects(action, (error) => {
 			assert.equal(error, helperSignal?.reason);
 			return true;
@@ -746,6 +1070,8 @@ test("session replacement aborts an in-flight workflow helper", async () => {
 		await app.start(replacement);
 		await cancelled;
 		assert.equal(helperSignal?.aborted, true);
+		assert.equal(await app.beforeSettle(replacement), undefined);
+		await assert.rejects(app.callTool(route === "fix-ci" ? "pi_pr_fix_ci" : "pi_pr_update_branch", { runId: routeRunId, action: route === "fix-ci" ? "collect" : "rebase" }, replacement), /No PR workflow/);
 	} finally {
 		await app.shutdown(replacement);
 	}
@@ -817,53 +1143,59 @@ test("tool cancellation reaches only its active workflow action", async () => {
 	}
 });
 
-test("keeps a queued follow-up until its exact prompt starts, then clears an unused run", async () => {
-	const authority = currentPullRequest({ conditions: { ci: "failure" } });
-	let idle = false;
+for (const outcome of ["completed", "aborted", "error"]) {
+	test(`busy /pr launch is consumed at boundary or cancelled (${outcome})`, async () => {
+		let idle = false;
+		let loads = 0;
+		const app = harness({
+			async load() { loads += 1; return currentPullRequest({ conditions: { ci: "failure" } }); },
+			useDefaultCommandHandler: true, isIdle: () => idle, newRunId: () => routeRunId,
+			async canonicalWorktree() { return "/canonical/repo"; },
+			createCiFixer: () => ({} as never),
+		});
+		const ctx = app.context();
+		try {
+			await app.start(ctx);
+			await app.command().handler("", ctx as ExtensionCommandContext);
+			assert.deepEqual(app.messages, []);
+			const result = await app.beforeSettle(ctx, outcome);
+			if (outcome === "completed") {
+				assert.equal(result?.continue, true);
+				const entry = result?.entries?.[0];
+				assert.equal(entry?.type, "custom_message");
+				if (entry?.type === "custom_message") {
+					assert.equal(entry.display, false);
+					assert.match(String(entry.content), /name="pi-pr-fix-ci"/);
+					assert.match(String(entry.content), new RegExp(`runId=${routeRunId} action=collect`));
+				}
+				assert.equal(await app.beforeSettle(ctx), undefined, "an unused launch is not replayed");
+			} else assert.equal(result, undefined);
+			assert.equal(loads, 2, "launch handoff must not rediscover the reserved route");
+			idle = true;
+			await app.settle(ctx);
+			assert.equal(loads, 3);
+			await assert.rejects(app.callTool("pi_pr_fix_ci", { runId: routeRunId, action: "collect" }, ctx), /No PR workflow is active/);
+		} finally { await app.shutdown(ctx); }
+	});
+}
+
+test("reports an unreadable boundary skill and releases its reserved run without retry", async () => {
 	let loads = 0;
-	const calls: string[] = [];
 	const app = harness({
-		async load() { loads += 1; return authority; },
-		useDefaultCommandHandler: true,
-		isIdle: () => idle,
-		newRunId: () => routeRunId,
+		async load() { loads += 1; return currentPullRequest({ conditions: { ci: "failure" } }); },
+		useDefaultCommandHandler: true, isIdle: () => false, newRunId: () => routeRunId,
 		async canonicalWorktree() { return "/canonical/repo"; },
-		createCiFixer() {
-			return {
-				async collect() { calls.push("collect"); return { fingerprint: "f".repeat(64), failures: [] }; },
-				async publish() { return { kind: "published", head: authority.head.oid, attempt: "applied" }; },
-			} as never;
-		},
+		createCiFixer: () => ({} as never), skillPath: "/missing/pi-pr-fix-ci/SKILL.md",
 	});
 	const ctx = app.context();
-
 	try {
 		await app.start(ctx);
 		await app.command().handler("", ctx as ExtensionCommandContext);
-		idle = true;
-		await app.settle(ctx);
-		for (const prompt of [
-			`<skill name="pi-pr-fix-ci" location="/skills/fix-ci/SKILL.md">\n\nunrelated runId=prefix-${routeRunId}-suffix action=collect`,
-			`<skill name="pi-pr-comment-sweep" location="/skills/sweep/SKILL.md">\n\nrunId=${routeRunId} action=collect`,
-			`<skill name="pi-pr-fix-ci" location="/skills/fix-ci/SKILL.md">\n\nrunId=${routeRunId} action=publish`,
-		]) {
-			await app.beforeStart(prompt, ctx);
-			await app.settle(ctx);
-		}
-		assert.equal(loads, 2, "a substring or wrong helper identity must not finish the queued workflow");
-
-		await app.beforeStart(`<skill name="pi-pr-fix-ci" location="/skills/fix-ci/SKILL.md">\n\nrunId=${routeRunId} action=collect`, ctx);
-		await app.settle(ctx);
-		assert.equal(loads, 3);
-		assert.deepEqual(app.widgets.at(-1), widgetLine("✗ Run /pr to fix CI"));
-		assert.deepEqual(calls, []);
-		await assert.rejects(
-			app.callTool("pi_pr_fix_ci", { runId: routeRunId, action: "collect" }, ctx),
-			/No PR workflow is active/,
-		);
-	} finally {
-		await app.shutdown(ctx);
-	}
+		assert.equal(await app.beforeSettle(ctx), undefined);
+		assert.match(app.notifications.at(-1)!.message, /PR continuation stopped:.*ENOENT/);
+		assert.equal(loads, 2, "failed launch must not immediately retry discovery");
+		await assert.rejects(app.callTool("pi_pr_fix_ci", { runId: routeRunId, action: "collect" }, ctx), /No PR workflow is active/);
+	} finally { await app.shutdown(ctx); }
 });
 
 test("keeps an exact conflict context for continuation, then clears it on settlement", async () => {
@@ -1479,7 +1811,7 @@ test("renders the shared projection and refreshes after successful create or pus
 	}, ctx);
 	assert.equal(signals.length, 2);
 	assert.equal(plain(app.statuses.at(-1) ?? ""), "PR #42 · CI running");
-	assert.equal(app.widgets.at(-1), undefined);
+	assert.deepEqual(app.widgets.at(-1), widgetLine("! Run /pr to wait for CI, then continue"));
 
 	await app.tool({ toolName: "bash", input: { command: "git push origin HEAD" }, isError: false }, ctx);
 	assert.equal(signals.length, 3);

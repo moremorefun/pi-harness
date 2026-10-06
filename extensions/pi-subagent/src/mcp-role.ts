@@ -1,6 +1,6 @@
 import { readFileSync } from "node:fs";
 import { join } from "node:path";
-import type { LoadedMcpConfig, McpServerConfig } from "@earendil-works/pi-coding-agent";
+import { VERSION, type LoadedMcpConfig, type McpServerConfig } from "@earendil-works/pi-coding-agent";
 
 export function parseRoleMcpAllowlist(value: unknown): string[] {
 	if (typeof value !== "string") throw new Error("The Role MCP policy flag must contain a JSON array of MCP server names.");
@@ -34,6 +34,11 @@ const isHttpsOrLoopback = (url: URL | undefined) =>
 	url !== undefined && (url.protocol === "https:" || (url.protocol === "http:" && LOOPBACK_HOSTS.includes(url.hostname)));
 /** Tool namespace `mcp__<server>` replaces `-` with `_`, so names differing only there collide. */
 const mcpNamespace = (name: string) => name.replace(/-/g, "_");
+// Pi's exposure names and the alias it still accepts (core/mcp-servers.ts); the native loader is bypassed, so resolve it here.
+const MCP_EXPOSURES = ["codemode", "deferred", "direct", "hidden"] as const;
+const MCP_EXPOSURE_ALIASES: Record<string, string> = { "codemode-deferred": "codemode" };
+const resolveExposure = (value: string) => MCP_EXPOSURE_ALIASES[value] ?? value;
+const isExposure = (value: unknown) => typeof value === "string" && (MCP_EXPOSURES as readonly string[]).includes(resolveExposure(value));
 
 type FieldCheck = [(value: unknown, server: Record<string, unknown>) => boolean, string];
 /** Documented `mcpServers` fields (Pi's docs/mcp.md) and their shapes, by transport; dotted keys are nested. */
@@ -62,12 +67,17 @@ const HTTP_CHECKS: Record<string, FieldCheck> = {
 	}, "an http URL on localhost, 127.0.0.1, or [::1] without query or fragment, on the \"oauth.callbackPort\" port"],
 	"oauth.scope": [isString, "a string"],
 	"oauth.clientName": [(value) => typeof value === "string" && value.trim() !== "", "a non-empty string"],
+	"oauth.clientRegistration": [(value) => value === "dcr" || value === "cimd", '"dcr" or "cimd"'],
 	"oauth.authServerMetadataUrl": [(value) => isHttpsOrLoopback(parseUrl(value)), "an https URL, or http on localhost, 127.0.0.1, or [::1]"],
 	auth: [(value) => isRecord(value) && typeof value.provider === "string" && value.provider !== "", "an object with a non-empty \"provider\" string"],
 };
+const EXPOSURE_CHECKS: Record<string, FieldCheck> = {
+	exposure: [isExposure, `one of ${MCP_EXPOSURES.map((exposure) => `"${exposure}"`).join(", ")}`],
+	toolExposure: [(value) => isRecord(value) && Object.values(value).every(isExposure), "an object mapping tool names to exposures"],
+};
 
 /** Validate one selected server against Pi's documented `mcpServers` rules; the native loader is bypassed by `loadConfig`. */
-function validateRoleMcpServer(path: string, name: string, value: unknown): McpServerConfig {
+function validateRoleMcpServer(path: string, name: string, value: unknown, codemode: boolean, piVersion: string): McpServerConfig {
 	const fail: (message: string) => never = (message) => { throw new Error(`${path}: MCP server "${name}" ${message}`); };
 	if (!SERVER_NAME.test(name)) fail("has an invalid name (use letters, digits, \"_\" and \"-\").");
 	if (!isRecord(value)) fail("must be an object.");
@@ -75,13 +85,31 @@ function validateRoleMcpServer(path: string, name: string, value: unknown): McpS
 	const stdio = typeof value.command === "string" && value.command.trim() !== "" && (value.type === undefined || value.type === "stdio");
 	const http = typeof value.url === "string" && value.url.trim() !== "" && (value.type === undefined || value.type === "http" || value.type === "streamable-http");
 	if (stdio === http) fail("needs either a \"command\" (stdio) or a \"url\" (http or streamable-http).");
-	for (const [field, [valid, shape]] of Object.entries({ ...COMMON_CHECKS, ...(stdio ? STDIO_CHECKS : HTTP_CHECKS) })) {
+	for (const [field, [valid, shape]] of Object.entries({ ...COMMON_CHECKS, ...(stdio ? STDIO_CHECKS : HTTP_CHECKS), ...(codemode ? EXPOSURE_CHECKS : {}) })) {
 		const fieldValue = field.split(".").reduce<unknown>((parent, key) => (isRecord(parent) ? parent[key] : undefined), value);
 		if (fieldValue !== undefined && !valid(fieldValue, value)) fail(`field "${field}" must be ${shape}.`);
+	}
+	if (http && isRecord(value.oauth) && value.oauth.clientRegistration === "cimd") {
+		if (piVersion === "1.0.0") fail('field "oauth.clientRegistration" "cimd" requires Pi 1.0.1 or later; current Pi is 1.0.0.');
+		if (value.oauth.clientId !== undefined || value.oauth.clientName !== undefined) {
+			fail('field "oauth.clientRegistration" "cimd" cannot be combined with "oauth.clientId" or "oauth.clientName".');
+		}
+		const callback = parseUrl(value.oauth.callbackUrl);
+		if (callback && (callback.hostname === "[::1]" || callback.pathname !== "/callback")) {
+			fail('field "oauth.clientRegistration" "cimd" requires "oauth.callbackUrl" on localhost or 127.0.0.1 with path /callback.');
+		}
 	}
 	// The native transport sends the provider's token to `url`, so Pi only allows it over https or loopback.
 	if (value.auth !== undefined && !isHttpsOrLoopback(parseUrl(value.url))) {
 		fail("field \"auth\" requires \"url\" to use https, or http on localhost, 127.0.0.1, or [::1].");
+	}
+	if (codemode) {
+		const { exposure, toolExposure } = value;
+		return {
+			...value,
+			...(typeof exposure === "string" ? { exposure: resolveExposure(exposure) } : {}),
+			...(isRecord(toolExposure) ? { toolExposure: Object.fromEntries(Object.entries(toolExposure).map(([tool, entry]) => [tool, resolveExposure(entry as string)])) } : {}),
+		} as McpServerConfig;
 	}
 	const { toolExposure: _toolExposure, ...config } = value;
 	return { ...config, exposure: "direct" } as McpServerConfig;
@@ -89,10 +117,12 @@ function validateRoleMcpServer(path: string, name: string, value: unknown): McpS
 
 /**
  * Select the Role's allowlisted servers from the global `mcp.json` in Pi's native `mcpServers`
- * shape; the project `.pi/mcp.json` is ignored. A `--no-extensions` child has no codemode tool, so
- * every selected server is forced to direct exposure and codemode is never activated.
+ * shape; the project `.pi/mcp.json` is ignored. A child that activates `codemode` keeps each
+ * server's configured exposure, so scripts reach `codemode` and `deferred` tools. Any other child
+ * cannot reach undeclared tools, so every selected server is forced to direct exposure. Codemode is
+ * never activated by MCP configuration: the Role tool policy owns the active set.
  */
-export function loadRoleMcpConfig(agentDir: string, allowlist: readonly string[]): LoadedMcpConfig {
+export function loadRoleMcpConfig(agentDir: string, allowlist: readonly string[], options: { codemode: boolean; piVersion?: string } = { codemode: false }): LoadedMcpConfig {
 	const path = join(agentDir, "mcp.json");
 	let parsed: unknown = {};
 	try {
@@ -113,7 +143,7 @@ export function loadRoleMcpConfig(agentDir: string, allowlist: readonly string[]
 		const clash = namespaces.get(mcpNamespace(name));
 		if (clash) throw new Error(`${path}: Role MCP server "${name}" conflicts with "${clash}": names that differ only in "-" and "_" share one tool namespace.`);
 		namespaces.set(mcpNamespace(name), name);
-		return { name, config: validateRoleMcpServer(path, name, configured[name]), source: path, scope: "global" as const };
+		return { name, config: validateRoleMcpServer(path, name, configured[name], options.codemode, options.piVersion ?? VERSION), source: path, scope: "global" as const };
 	});
 	return { servers, autoEnableCodemode: false, errors: [] };
 }

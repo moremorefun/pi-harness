@@ -4,7 +4,7 @@
 
 Own Role-configured Pi delegation through one `delegate_task` surface:
 
-- **direct mode** runs read-only compact work in Herdr tabs in Main's workspace and returns a handle before completion;
+- **direct mode** runs authorized compact shared-checkout work in Herdr tabs in Main's workspace and returns a handle before completion;
 - **isolated mode** runs durable checked graphs with Herdr worktrees, exact Git identities, guarded integration, and recovery; and
 - the package root exposes the Role, executor, worktree, evidence, schema, state, and runtime mechanisms used by the extension.
 
@@ -13,7 +13,7 @@ Own Role-configured Pi delegation through one `delegate_task` surface:
 - **Main**: the Pi session and checkout coordinating delegated work.
 - **Role**: package or user Markdown defining responsibility, tools, trusted extension sources, Skills, optional MCP names, instructions, and an optional model-class default. Roles do not select isolation.
 - **Model Class**: `fast`, `balanced`, `frontier`, or `fav`, resolved through `pi-task-models`.
-- **Direct task**: one task using read-only base tools in a Herdr tab in Main's current workspace; trusted extensions and MCP servers are not read-only constrained.
+- **Direct task**: one bounded task using its Role's declared resources in Main's shared checkout; authorized writes take effect immediately without checked integration.
 - **Isolated request**: one durable ID, goal, and checked task graph.
 - **Candidate**: exact clean committed task-worktree identity produced by an isolated changeset worker.
 - **Readiness**: durable proof that one exact live-worker candidate passed its preliminary checks and is sealed for Main's explicit selection; it is not a separate user approval.
@@ -41,7 +41,8 @@ Own Role-configured Pi delegation through one `delegate_task` surface:
 
 ### Direct evidence
 
-- Direct mode admits Roles with known read-only base tools. Extensions and MCP servers are trusted without a read-only guarantee; direct changesets and Roles with write-capable base tools require isolated mode.
+- Direct mode admits declared write-capable resources for explicitly authorized scope while preserving read-only Role restrictions. Potential-writer requests serialize tasks and retain Pi checkout admission until exact owned worker termination is proved by pane absence and two empty private process-lease scans; uncertain termination retains admission and live recovery ownership. Potential-writer answers require an explicit structured `succeeded` outcome; failed, blocked, or malformed completion stops dispatch but does not prevent release after proved termination. `/subagent` Close/cancel-and-release retries termination under session, branch, epoch and exact ownership guards without replaying work or removing checkout/session evidence. This is a worker report, not proof of validation, cleanliness, rollback, or checked integration. Direct changesets require isolated mode.
+- Checkout admission in Main serializes write-capable Pi tool calls per checkout by their model-issued root call: a `codemode` script's nested writes share the script's ownership, independent writers wait, and reads never wait.
 - Each direct worker has a recorded Herdr tab and Pi session identity. The first handle returns before completion; subsequent tab identities remain recoverable on the session branch.
 - An exact settled worker with a bounded final Pi answer produces a follow-up to Main. Blocked, unknown, idle-stalled, truncated, or ambiguous outcomes retain actionable recovery identity. Session replacement never delivers to the wrong Main session.
 
@@ -56,18 +57,20 @@ Own Role-configured Pi delegation through one `delegate_task` surface:
 - Promotion requires exact unchanged clean Main and a passing combined generation. Durable promotion evidence precedes selected-worker termination and cleanup; recovery never rolls back a proven promotion.
 - Rejected workers and superseded generations stay retained until Main explicitly releases their exact clean, proved-owned resources. At most two unreleased integration checkouts coexist.
 - Failures, ambiguity, interruption, review findings, conflicts, drift, unproved termination, or cleanup failure enter `needs_attention` and preserve evidence.
-- `subagent_status` is read-only. `subagent_resume` accepts only strict `retry`, `verify`, or `finalize` continuations. `subagent_abort` terminates only exact owned workers.
+- `subagent_status` is read-only, callable from `codemode` scripts, and returns the bounded public projection as structured content, never raw run state. `delegate_task`, `subagent_resume`, `subagent_stage`, `subagent_integrate`, and `subagent_abort` are model-only. `subagent_resume` accepts only strict `retry`, `verify`, or `finalize` continuations. `subagent_abort` terminates only exact owned workers.
 - The extension never pushes, opens a pull request, publishes, deploys, stashes, resets, force-cleans, or deletes unproved recoverable work.
 
 ### Resource and launch policy
 
 - Ambient child extensions and Skills stay disabled. Only Role/caller resources plus required internal adapters load.
-- Every Role requires `tools`, `extensions`, and `skills` arrays. `extensions` may name Pi built-in extensions as `builtin:<name>`. `mcps` names servers from the global `~/.pi/agent/mcp.json`; their tools load in the child with direct exposure. Omitted or empty `mcps` denies MCP access. Direct `pi-mcp-adapter` loading is rejected because it bypasses the allowlist.
+- Every Role requires `tools`, `extensions`, and `skills` arrays. `extensions` may name Pi built-in extensions as `builtin:<name>`. A Role activates `codemode` only by naming it in `tools` with `builtin:codemode` loaded; MCP configuration never activates it, and Pi's codemode settings apply unchanged. `mcps` names servers from the global `~/.pi/agent/mcp.json`; their tools keep their configured exposure in a codemode Role and are forced to direct exposure otherwise. Omitted or empty `mcps` denies MCP access. Direct `pi-mcp-adapter` loading is rejected because it bypasses the allowlist.
+- The Role tool policy declares the Role's `tools` and the extension tools Pi would declare on registration; extension tools with `codemode` or `deferred` exposure stay callable from scripts without being declared.
 - Selected extensions are trusted executable bundles, not a sandbox. All tools and lifecycle behavior they register load together.
 - Role Skill names resolve through Main's effective Pi registry. Missing Roles, Skills, tools, MCP servers, routes, models, or thinking levels fail before the first productive turn.
 - Route precedence is call model class, then Role default, then registered Model Task assignment/default. A direct model replaces only the route model and must support its thinking level.
 - Main-only delegation/recovery tools and `ask_question` are excluded from children. Recursive delegation is unavailable.
 - Package built-ins are `implementer`, `reviewer`, and `scout`; a same-named user Role overrides a built-in.
+- `git_read` is an internal read-only child tool loaded only for Roles declaring it; the built-in reviewer opts in. Fixed structured Git operations provide bounded local evidence without Bash, network, external filters, or mutations. Named-ref context supplements but never replaces the authoritative exact isolated review patch.
 
 ### Executor boundaries
 

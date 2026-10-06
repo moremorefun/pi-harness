@@ -42,8 +42,7 @@ export const DirectWorkflowSchema = Type.Object({
 	chain: Type.Optional(Type.Array(DelegationSchema, { minItems: 1, maxItems: MAX_WORKFLOW_ENTRIES })),
 }, { additionalProperties: false, description: "Direct mode: exactly one compact single, tasks, or chain workflow" });
 
-export const DelegateTaskSchema = Type.Union([DirectWorkflowSchema, ExecuteRequestSchema]);
-// Keep the strict mode union for parsing; expose a plain object root to tool providers.
+// Parse each mode with its strict schema; expose a plain object root to tool providers.
 export const DelegateTaskParameters = Type.Object({
 	...DirectWorkflowSchema.properties,
 	mode: Type.Union([DirectWorkflowSchema.properties.mode, ExecuteRequestSchema.properties.mode]),
@@ -56,7 +55,6 @@ export const DelegateTaskParameters = Type.Object({
 	finalChecks: ExecuteRequestSchema.properties.finalChecks,
 	finalJudgment: ExecuteRequestSchema.properties.finalJudgment,
 }, { additionalProperties: false });
-export const WorkflowSchema = DirectWorkflowSchema;
 
 export type Delegation = Static<typeof DelegationSchema> & { kind: "text" };
 export type WorkflowMode = "single" | "parallel" | "chain";
@@ -109,7 +107,7 @@ export function parseWorkflow(value: unknown): ParsedWorkflow {
 	const mode = workflowMode(value);
 	if (!Check(DirectWorkflowSchema, value)) {
 		const issue = Errors(DirectWorkflowSchema, value)[0];
-		throw new Error(`direct workflow must match the declared tool schema${issue ? ` at ${issue.instancePath || "/"}: ${issue.message}` : ""}. Direct mode is read-only; use mode isolated for changesets.`);
+		throw new Error(`direct workflow must match the declared tool schema${issue ? ` at ${issue.instancePath || "/"}: ${issue.message}` : ""}. Direct mode returns task answers without checked integration; use mode isolated for changesets.`);
 	}
 	if (!mode) throw new Error("direct workflow must select exactly one of single, tasks, or chain.");
 	const input = value as DirectInput;

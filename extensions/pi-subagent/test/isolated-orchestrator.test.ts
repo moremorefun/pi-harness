@@ -4,6 +4,7 @@ import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import test from "node:test";
+import { Check } from "typebox/value";
 import type { ExtensionAPI, ExtensionContext, Theme } from "@earendil-works/pi-coding-agent";
 import { visibleWidth, type Component, type TUI } from "@earendil-works/pi-tui";
 import { ROLE_TOOL_POLICY_FLAG } from "@henryqw/pi-subagent";
@@ -17,15 +18,8 @@ import {
 import type { OperationContext, RunResponse } from "../src/runner.ts";
 import {
 	ExecuteRequestSchema,
-	IdOnlySchema,
-	ResumeRequestParameters,
-	StageRequestSchema,
-	IntegrationActionParameters,
-	parseIntegrationAction,
-	parseStageRequest,
 	parseExecuteRequest,
-	parseIdOnly,
-	parseResumeRequest,
+	StatusOutputSchema,
 	type ExecuteRequest,
 	type RunState,
 } from "../dist/schema.js";
@@ -157,6 +151,8 @@ type RegisteredCommand = { handler(args: string, ctx: ExtensionContext): Promise
 type RegisteredTool = {
 	name: string;
 	parameters: unknown;
+	outputSchema?: unknown;
+	exposure?: string;
 	prepareArguments(value: unknown): unknown;
 	execute(
 		toolCallId: string,
@@ -164,7 +160,7 @@ type RegisteredTool = {
 		signal: AbortSignal | undefined,
 		onUpdate: undefined,
 		ctx: ExtensionContext,
-	): Promise<{ content: Array<{ type: string; text: string }>; details: unknown }>;
+	): Promise<{ content: Array<{ type: string; text: string }>; details: unknown; structuredContent?: unknown }>;
 };
 
 type RunnerCall = { method: string; args: unknown[] };
@@ -323,7 +319,7 @@ async function executeTool(
 	signal: AbortSignal | undefined,
 	ctx: ExtensionContext,
 ) {
-	return await tool.execute("tool-call", params as never, signal, undefined, ctx);
+	return await tool.execute("tool-call", tool.prepareArguments(params) as never, signal, undefined, ctx);
 }
 
 function expectedPublicState() {
@@ -453,6 +449,24 @@ test("status restores active workspace rows and provides the non-TUI fallback", 
 		{ cwd: "/repo", hasUI: false } as ExtensionContext,
 	);
 	assert.equal(rpcResult.content[0]!.text, "bounded status result\n\nActive workspaces:\n! I [I1] unit-one · attention · The task needs a deliberate rec~ · 012345");
+});
+
+test("status hands codemode scripts the bounded public projection while mutating tools stay model-only", async () => {
+	const harness = createHarness();
+	const status = namedTool(harness, "subagent_status");
+	assert.equal(status.exposure, undefined);
+	assert.equal(status.outputSchema, StatusOutputSchema);
+	for (const name of ["subagent_resume", "subagent_stage", "subagent_integrate", "subagent_abort"]) {
+		assert.equal(namedTool(harness, name).exposure, "model-only", name);
+		assert.equal(namedTool(harness, name).outputSchema, undefined, name);
+	}
+	const result = await executeTool(status, { id: "request-one" }, undefined, context("/repo"));
+	assert.deepEqual(result.structuredContent, result.details);
+	assert.ok(Check(StatusOutputSchema, JSON.parse(JSON.stringify(result.structuredContent))));
+	const structured = result.structuredContent as { state: Record<string, unknown>; main: { status: string } };
+	assert.deepEqual(structured.state, expectedPublicState());
+	assert.equal(structured.main.status, "drifted");
+	assert.equal(JSON.stringify(result.structuredContent).includes("PRIVATE"), false);
 });
 
 test("aborted request keeps mixed task evidence distinct in status and widget", async () => {
@@ -631,23 +645,13 @@ test("registers six strict tools without constructing runtime components", () =>
 	assert.equal(harness.getComponentCreations(), 0);
 
 	const [execute, status, resume, stage, integrate, abort] = harness.tools;
-	assert.equal(execute!.parameters, ExecuteRequestSchema);
-	assert.equal(execute!.prepareArguments, parseExecuteRequest);
-	assert.equal(status!.parameters, IdOnlySchema);
-	assert.equal(status!.prepareArguments, parseIdOnly);
-	assert.equal(resume!.parameters, ResumeRequestParameters);
-	assert.equal(resume!.prepareArguments, parseResumeRequest);
-	assert.equal(stage!.parameters, StageRequestSchema);
-	assert.equal(stage!.prepareArguments, parseStageRequest);
 	assert.throws(() => stage!.prepareArguments({ id: "request-one", action: "stage", taskId: "unit-one" }), /exact candidate and generation/);
-	assert.equal(integrate!.parameters, IntegrationActionParameters);
-	assert.equal(integrate!.prepareArguments, parseIntegrationAction);
 	assert.throws(() => integrate!.prepareArguments({ id: "request-one", action: "promote" }), /exact generation and tip/);
-	assert.equal(abort!.parameters, IdOnlySchema);
-	assert.equal(abort!.prepareArguments, parseIdOnly);
-	assert.deepEqual(parseIdOnly({ id: "request-one" }), { id: "request-one" });
-	assert.throws(() => parseIdOnly({ id: "request-one", extra: true }), /strict schema/i);
-	assert.throws(() => parseIdOnly({ id: "Request_One" }), /strict schema/i);
+	for (const tool of [status!, abort!]) {
+		assert.deepEqual(tool.prepareArguments({ id: "request-one" }), { id: "request-one" });
+		assert.throws(() => tool.prepareArguments({ id: "request-one", extra: true }), /strict schema/i);
+		assert.throws(() => tool.prepareArguments({ id: "Request_One" }), /strict schema/i);
+	}
 	assert.throws(() => execute!.prepareArguments({ ...EXECUTE_REQUEST, extra: true }), /strict task schema/i);
 	assert.throws(() => resume!.prepareArguments({ id: "request-one", action: "finalize", taskId: "unit-one" }), /must match one strict action/i);
 });
@@ -996,6 +1000,41 @@ test("advance acknowledges a dependent wave before its workers finish", async ()
 	assert.equal(harness.sent.length, 1);
 });
 
+test("validate acknowledges its exact durable intent and outlives the calling turn", async () => {
+	const done = deferred<RunResponse>();
+	let save!: (state: RunState) => void;
+	let runSignal!: AbortSignal;
+	const validating = structuredClone(PRIVATE_STATE);
+	validating.integration.generations = [{ number: 1, status: "validating", expectedMain: RECORDED_MAIN,
+		integrationBase: RECORDED_MAIN, combinedTip: CURRENT_MAIN, order: [], stages: [] }];
+	const harness = createHarness({
+		onCreate(options) { save = options.onStateSaved; },
+		runner: { async integrate(_action: unknown, _root: string, signal: AbortSignal) {
+			runSignal = signal;
+			save(validating);
+			return await done.promise;
+		} } as never,
+	});
+	const ctx = { ...context(CANONICAL_ROOT), sessionManager: { getSessionId: () => "origin" } } as ExtensionContext;
+	harness.handlers.get("session_start")!({}, ctx);
+	const turn = new AbortController();
+	const pending = executeTool(namedTool(harness, "subagent_integrate"),
+		{ id: "request-one", generation: 1, action: "validate", expectedTip: CURRENT_MAIN }, turn.signal, ctx);
+	const result = await Promise.race([pending, new Promise<undefined>((resolve) => setImmediate(() => resolve(undefined)))]);
+	try {
+		assert.ok(result, "validation must acknowledge before checks/review finish");
+		assert.match(result.content[0]!.text, /durable request accepted/);
+		turn.abort();
+		assert.equal(runSignal.aborted, false, "durable validation belongs to the session, not the turn");
+	} finally {
+		done.resolve(response("validate", true, validating));
+		await pending;
+	}
+	await new Promise(setImmediate);
+	assert.equal(harness.sent.length, 1);
+	assert.deepEqual(harness.sent[0]!.options, { triggerTurn: true, deliverAs: "followUp" });
+});
+
 test("preflight errors reject before acknowledgement; post-save failures report durable recovery", async () => {
 	const failedPreflight = createHarness({ runner: { async execute() { throw new Error("host preflight failed"); } } as never });
 	await assert.rejects(executeTool(namedTool(failedPreflight, "delegate_task"), EXECUTE_REQUEST, undefined, context(CANONICAL_ROOT)), /host preflight failed/);
@@ -1301,12 +1340,14 @@ test("execute keeps raw cwd while lookup actions use canonical root, bounded con
 	assert.deepEqual(harness.runnerCalls.find(({ method }) => method === "status")!.args, ["request-one", CANONICAL_ROOT, signals[1]]);
 	assert.deepEqual(harness.runnerCalls.find(({ method }) => method === "abort")!.args, ["request-one", CANONICAL_ROOT, signals[3]]);
 	assert.match(execute.content[0]!.text, /durable request accepted/);
+	const publicStatus = {
+		state: expectedPublicState(),
+		main: { status: "drifted", expected: RECORDED_MAIN, actual: CURRENT_MAIN },
+	};
 	assert.deepEqual(status, {
 		content: [{ type: "text", text: "bounded status result" }],
-		details: {
-			state: expectedPublicState(),
-			main: { status: "drifted", expected: RECORDED_MAIN, actual: CURRENT_MAIN },
-		},
+		details: publicStatus,
+		structuredContent: publicStatus,
 	});
 	assert.match(resume.content[0]!.text, /durable request accepted/);
 	assert.deepEqual(abort, { content: [{ type: "text", text: "bounded abort result" }], details: { state: expectedPublicState() } });
@@ -1359,14 +1400,14 @@ test("manifest entrypoint and Main-side Skill ship with the unified tools", asyn
 		pi?: { extensions?: string[]; skills?: string[] };
 	};
 	assert.equal(manifest.dependencies?.["@henryqw/pi-subagent"], undefined);
-	assert.equal(manifest.dependencies?.["@henryqw/pi-herdr"], "^0.4.7");
+	assert.equal(manifest.dependencies?.["@henryqw/pi-herdr"], "^0.4.9");
 	assert.deepEqual(manifest.pi?.extensions, ["./extensions/subagent.ts"]);
 	assert.deepEqual(manifest.pi?.skills, ["./skills"]);
 	for (const path of ["README.md", "CONTEXT.md", "skills"]) assert.ok(manifest.files?.includes(path));
 	const skill = await readFile(resolve(PACKAGE_ROOT, "skills/pi-subagent/SKILL.md"), "utf8");
 	for (const contract of [
 		/^name: pi-subagent$/m,
-		/`mode: direct`.*read-only.*research/is,
+		/`mode: direct`.*explicitly authorized shared-checkout writes and commits/is,
 		/`mode: isolated`.*checked changes/is,
 		/focused task checks.*`pnpm test`.*combined tip.*Main promotion/is,
 		/`subagent_status`.*`subagent_resume`.*`subagent_abort`/is,

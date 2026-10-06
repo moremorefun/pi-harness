@@ -2,7 +2,8 @@ import { readFile } from "node:fs/promises";
 import { join } from "node:path";
 
 import { defineConfig } from "blume";
-import type { ContentSource } from "blume/sources/types.ts";
+import { orama } from "blume/search";
+import { custom, type ContentSource } from "blume/sources";
 
 import { catalog, extensions, repoRoot, supportLibraries } from "./extension-catalog.ts";
 import { licenseBadgeUrl, npmBadgeUrl, versionBadgeUrl } from "./npm-badge.ts";
@@ -99,11 +100,9 @@ export default defineConfig({
   feedback: false,
   logo: { image: "/favicon.ico", text: "Henry Pi Harness" },
   content: {
-    root: ".",
-    sources: [{ type: "custom", source: packageDocs }],
+    sources: [custom(packageDocs)],
   },
   deployment: {
-    output: "static",
     site: "https://pi.henry.wang",
   },
   github: {
@@ -128,6 +127,26 @@ export default defineConfig({
   },
   redirects: [
     {
+      from: "/extensions/pi-herdr-btw",
+      to: "/extensions/pi-herdr-tools",
+    },
+    {
+      from: "/extensions/pi-herdr-clone",
+      to: "/extensions/pi-herdr-tools",
+    },
+    {
+      from: "/extensions/pi-herdr-rename",
+      to: "/extensions/pi-herdr-tools",
+    },
+    {
+      from: "/extensions/pi-herdr-done",
+      to: "/extensions/pi-herdr-tools",
+    },
+    {
+      from: "/extensions/pi-open-in",
+      to: "/extensions/pi-footer",
+    },
+    {
       from: "/extensions/pi-config-store",
       to: "/packages/pi-config-store",
     },
@@ -144,9 +163,8 @@ export default defineConfig({
       to: "https://github.com/HenryQW/pi-harness/blob/main/docs/releasing.md",
     },
   ],
-  search: { provider: "orama" },
+  search: orama(),
   seo: {
-    agentReadability: true,
     og: {
       description: "Built on Pi. Tuned by Henry.",
       logo: "/og-logo.svg",
@@ -159,11 +177,14 @@ export default defineConfig({
       },
     },
   },
-  ai: {
+  agents: {
+    agentReadability: true,
     llmsTxt: {
       enabled: true,
       openapi: false,
     },
+  },
+  ai: {
     openInChat: ["claude", "chatgpt", "cursor"],
   },
   theme: {

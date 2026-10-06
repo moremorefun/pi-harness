@@ -1,3 +1,4 @@
+import type { PrRun } from "./pr-run.ts";
 import { readFile } from "node:fs/promises";
 import { createHash } from "node:crypto";
 import { join, resolve } from "node:path";
@@ -39,11 +40,22 @@ type UpdateBranchState = {
 type UpdateBranchResult =
 	| { kind: "verified"; head: string; fastForward: boolean }
 	| { kind: "conflict"; paths: string[] }
-	| { kind: "published"; head: string };
+	| { kind: "published"; head: string }
+	| { kind: "stale"; reason: string; authority: CurrentPullRequest };
+
+// Only pre-mutation preflight can authorize a fresh routing snapshot, never a replay.
+class StaleRebaseRoute extends Error {
+	readonly authority: CurrentPullRequest;
+	constructor(reason: string, authority: CurrentPullRequest) {
+		super(reason);
+		this.authority = authority;
+	}
+}
 
 type Load = typeof loadCurrentPullRequest;
 
 export type UpdateBranchOptions = {
+	run?: PrRun;
 	cwd: string;
 	authority: CurrentPullRequest;
 	signal?: AbortSignal;
@@ -54,7 +66,7 @@ export type UpdateBranchOptions = {
 
 function sameAuthority(frozen: CurrentPullRequest, fresh: CurrentPullRequest): boolean {
 	return samePullRequestSnapshot(frozen, fresh) && frozen.base.oid === fresh.base.oid &&
-		fresh.lifecycle === "open" && fresh.conditions.conflict;
+		fresh.lifecycle === "open" && (fresh.conditions.conflict || fresh.conditions.baseUpdateRequired);
 }
 
 type RebaseRecovery = { version: 1; phase: "pending" | "verified" | "published"; identity: string;
@@ -112,6 +124,7 @@ export async function inspectVerifiedRebaseRecovery(pr: CurrentPullRequest, opti
 export class PullRequestBranchUpdater {
 	readonly state: UpdateBranchState = { phase: "ready" };
 
+	private readonly run?: PrRun;
 	private readonly cwd: string;
 	private readonly authority: CurrentPullRequest;
 	private readonly signal?: AbortSignal;
@@ -126,6 +139,7 @@ export class PullRequestBranchUpdater {
 			throw new TypeError("Branch update requires a configured open pull request");
 		}
 		this.cwd = options.cwd;
+		this.run = options.run;
 		this.authority = cloneCurrentPullRequest(options.authority);
 		this.signal = options.signal;
 		this.agentDir = options.agentDir;
@@ -145,18 +159,18 @@ export class PullRequestBranchUpdater {
 		return { cwd: this.cwd, signal: this.signal };
 	}
 
-	private async freshAuthority(expectedHead: string, requireClean: boolean, published = false): Promise<CurrentPullRequest> {
+	private async freshAuthority(expectedHead: string, requireClean: boolean, published = false, beforeRebase = false): Promise<CurrentPullRequest> {
 		const discovery = await this.load(this.pi(), this.context());
-		const comparison = published ? {
+		if (discovery.kind !== "current") throw new Error("Branch update cancelled: pull request is no longer current");
+		const fresh = discovery.pullRequest;
+		const comparison = beforeRebase || published ? {
 			...this.authority,
-			head: { ...this.authority.head, oid: expectedHead },
-			target: { ...this.authority.target, remoteOid: expectedHead },
+			head: { ...this.authority.head, oid: beforeRebase ? fresh.head.oid : expectedHead },
+			target: { ...this.authority.target, remoteOid: beforeRebase ? fresh.target.remoteOid : expectedHead },
 		} : this.authority;
-		if (discovery.kind !== "current" || (published
-			? !samePullRequestSnapshot(comparison, discovery.pullRequest) ||
-				this.authority.base.oid !== discovery.pullRequest.base.oid || discovery.pullRequest.lifecycle !== "open"
-			: !sameAuthority(this.authority, discovery.pullRequest))) {
-			throw new Error("Branch update cancelled: frozen pull request authority changed");
+		if (!samePullRequestSnapshot(comparison, fresh) || fresh.lifecycle !== "open" ||
+			(!beforeRebase && (this.authority.base.oid !== fresh.base.oid || !published && !(fresh.conditions.conflict || fresh.conditions.baseUpdateRequired)))) {
+			throw new Error("Branch update cancelled: frozen pull request authority changed (identity, lifecycle, destination, or post-rebase authority)");
 		}
 		const branch = parseSingleOutputLine((await runChecked(this.exec, "git", ["branch", "--show-current"], this.execOptions())).stdout, "current branch");
 		if (branch !== this.authority.target.branch) throw new Error("Branch update cancelled: current branch changed");
@@ -164,8 +178,39 @@ export class PullRequestBranchUpdater {
 			throw new Error("Branch update cancelled: worktree is dirty or a Git operation is in progress");
 		}
 		const head = await readHead(this.exec, this.execOptions());
-		if (head !== expectedHead) throw new Error("Branch update cancelled: local HEAD changed");
-		return discovery.pullRequest;
+		const reasons: string[] = [];
+		if (beforeRebase) {
+			if (fresh.target.remoteOid !== this.authority.target.remoteOid || fresh.head.oid !== expectedHead) {
+				if (this.authority.target.remoteOid !== expectedHead || fresh.target.remoteOid !== fresh.head.oid ||
+					head !== fresh.head.oid || !(await isAncestor(this.exec, this.execOptions(), expectedHead, head))) {
+					throw new Error("Branch update cancelled: frozen pull request authority changed; head/remote drift is not a clean, already-published fast-forward");
+				}
+				reasons.push("Published PR head advanced by fast-forward");
+			} else if (head !== expectedHead && await isAncestor(this.exec, this.execOptions(), expectedHead, head)) {
+				reasons.push("Local HEAD is ahead of the frozen PR head");
+			} else if (head !== expectedHead) {
+				throw new Error("Branch update cancelled: local HEAD does not match the expected head");
+			}
+			if (fresh.base.oid !== this.authority.base.oid) reasons.push("Base OID changed");
+			if (!fresh.conditions.conflict && !fresh.conditions.baseUpdateRequired) {
+				reasons.push(this.authority.conditions.conflict ? "PR conflict cleared" : "Required base update cleared");
+			}
+		} else if (head !== expectedHead) {
+			throw new Error("Branch update cancelled: local HEAD does not match the expected head");
+		}
+		if (reasons.length) {
+			if (fresh.target.remoteOid !== fresh.head.oid) {
+				throw new Error("Branch update cancelled: PR head and remote lease disagree");
+			}
+			const path = recoveryPath(this.cwd, this.authority, this.agentDir);
+			const recovery = await readRecovery(path, this.signal);
+			if (recovery && recovery.phase !== "published") {
+				throw new Error(`Branch update recovery requires reconciliation; record preserved at ${path}; do not replan or replay`);
+			}
+			this.signal?.throwIfAborted();
+			throw new StaleRebaseRoute(`${reasons.join("; ")}; cancelled before rebase or publication`, cloneCurrentPullRequest(fresh));
+		}
+		return fresh;
 	}
 
 	private async writeRecovery(phase: RebaseRecovery["phase"], verified: string | null): Promise<void> {
@@ -234,7 +279,7 @@ export class PullRequestBranchUpdater {
 		}
 		if (this.state.phase !== "ready") throw new Error("Branch conflict rebase action was already consumed");
 		return await withWorktreeLock(this.cwd, async () => {
-			await this.freshAuthority(this.authority.head.oid, true);
+			await this.freshAuthority(this.authority.head.oid, true, false, true);
 			const source = await resolveRepositoryFetchSource(this.exec, this.execOptions(), {
 				host: this.authority.host,
 				repository: this.authority.base.repository,
@@ -244,7 +289,7 @@ export class PullRequestBranchUpdater {
 				"fetch", "--no-write-fetch-head", "--no-tags", "--no-recurse-submodules", source, this.authority.base.oid,
 			], this.execOptions());
 			await runChecked(this.exec, "git", ["cat-file", "-e", `${this.authority.base.oid}^{commit}`], this.execOptions());
-			await this.freshAuthority(this.authority.head.oid, true);
+			await this.freshAuthority(this.authority.head.oid, true, false, true);
 			if (await isAncestor(this.exec, this.execOptions(), this.authority.base.oid, this.authority.head.oid)) {
 				return await this.verifyRebase();
 			}
@@ -255,7 +300,7 @@ export class PullRequestBranchUpdater {
 				"rev-list", "--max-count=1", "--min-parents=2", `${mergeBase}..${this.authority.head.oid}`,
 			], this.execOptions())).stdout.trim();
 			if (mergeCommits) throw new Error("Branch update cannot rebase a branch with merge commits; preserve its resolutions manually");
-			await this.freshAuthority(this.authority.head.oid, true);
+			await this.freshAuthority(this.authority.head.oid, true, false, true);
 			await this.writeRecovery("pending", null);
 			const result = await this.exec("git", ["-c", "core.editor=true", "-c", "rebase.backend=merge", "-c", "rebase.updateRefs=false", "rebase", "--no-autostash", "--onto", this.authority.base.oid, mergeBase], this.execOptions());
 			if (result.killed) throw new Error("git rebase was killed; its outcome is unknown");
@@ -265,7 +310,12 @@ export class PullRequestBranchUpdater {
 			} catch (error) {
 				throw new Error(`git rebase failed: ${result.stderr.trim() || result.stdout.trim() || `exit code ${result.code}`}; ${error instanceof Error ? error.message : String(error)}`);
 			}
-		}, { agentDir: this.agentDir, signal: this.signal });
+		}, { agentDir: this.agentDir, signal: this.signal }).catch((error: unknown) => {
+			if (!(error instanceof StaleRebaseRoute)) throw error;
+			this.signal?.throwIfAborted();
+			this.state.phase = "blocked";
+			return { kind: "stale" as const, reason: error.message, authority: error.authority };
+		});
 	}
 
 	async continue(resolvedPaths: readonly string[]): Promise<UpdateBranchResult> {
@@ -277,17 +327,25 @@ export class PullRequestBranchUpdater {
 			throw new Error("Resolved paths must include every original conflict path");
 		}
 		return await withWorktreeLock(this.cwd, async () => {
-			const discovery = await this.load(this.pi(), this.context());
+			const assertContext = async () => {
+				const path = parseSingleOutputLine((await runChecked(this.exec, "git", ["rev-parse", "--git-path", "rebase-merge/head-name"], this.execOptions())).stdout, "rebase branch marker");
+				const marker = await readFile(resolve(this.cwd, path), "utf8").catch((error) => {
+					if (error.code === "ENOENT") throw new Error("Branch rebase context changed", { cause: error });
+					throw error;
+				});
+				if (marker.trim() !== `refs/heads/${this.authority.target.branch}` ||
+					await readHead(this.exec, this.execOptions()) !== this.state.conflict!.head) {
+					throw new Error("Branch rebase context changed");
+				}
+			};
+			await assertContext();
+			const discovery = await this.load(this.pi(), { ...this.context(), rebaseBranch: this.authority.target.branch });
 			if (discovery.kind !== "current" || !sameAuthority(this.authority, discovery.pullRequest)) {
 				throw new Error("Branch rebase authority changed");
 			}
-			const path = parseSingleOutputLine((await runChecked(this.exec, "git", ["rev-parse", "--git-path", "rebase-merge/head-name"], this.execOptions())).stdout, "rebase branch marker");
-			if ((await readFile(resolve(this.cwd, path), "utf8")).trim() !== `refs/heads/${this.authority.target.branch}` ||
-				await readHead(this.exec, this.execOptions()) !== this.state.conflict!.head) {
-				throw new Error("Branch rebase context changed");
-			}
 			const status = await runChecked(this.exec, "git", ["status", "--porcelain=v2", "-z", "--untracked-files=all"], this.execOptions());
 			assertOnlyDeclaredStatusChanged(this.state.conflict!.statusBaseline, status.stdout, paths);
+			await assertContext();
 			this.state.phase = "blocked";
 			await runChecked(this.exec, "git", ["--literal-pathspecs", "add", "--", ...paths], this.execOptions());
 			const unmerged = parseNulPaths((await runChecked(this.exec, "git", ["diff", "--name-only", "-z", "--diff-filter=U"], this.execOptions())).stdout, "Unmerged paths");
@@ -314,11 +372,13 @@ export class PullRequestBranchUpdater {
 				throw new Error("Verified branch no longer contains the frozen base");
 			}
 			if (remoteBefore === head) {
+				this.run?.observeRemote(head);
 				await this.writeRecovery("published", head);
 				this.state.phase = "published";
 				return { kind: "published", head };
 			}
 			await this.freshAuthority(head, true);
+			this.run?.beforePush(original, head);
 			this.state.phase = "blocked";
 			let pushError: unknown;
 			try {
@@ -337,6 +397,7 @@ export class PullRequestBranchUpdater {
 				throw new Error("Rebase push outcome is unknown; do not retry");
 			}
 			if (remote === head) {
+				this.run?.observeRemote(head);
 				await this.writeRecovery("published", head);
 				this.state.phase = "published";
 				return { kind: "published", head };

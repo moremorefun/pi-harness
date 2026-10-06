@@ -1,3 +1,4 @@
+import type { JsonValue } from "@earendil-works/pi-ai";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { truncateToWidth } from "@earendil-works/pi-tui";
 import type { EphemeralSubagentExecutor } from "../dist/ephemeral.js";
@@ -22,11 +23,12 @@ import {
 	IntegrationActionParameters,
 	parseIntegrationAction,
 	parseStageRequest,
-	parseExecuteRequest,
 	parseIdOnly,
 	parseResumeRequest,
 	sameIdentity,
+	StatusOutputSchema,
 	type CheckBatchEvidence,
+	type ExecuteRequest,
 	type ModelClass,
 	type ReviewEvidence,
 	type RunState,
@@ -410,7 +412,7 @@ function toolResult(response: RunResponse, ctx: ExtensionContext, rowsByRequest:
 }
 
 export interface IsolatedSurface {
-	execute(params: unknown, signal: AbortSignal | undefined, ctx: ExtensionContext): Promise<ReturnType<typeof toolResult>>;
+	execute(request: ExecuteRequest, signal: AbortSignal | undefined, ctx: ExtensionContext): Promise<ReturnType<typeof toolResult>>;
 	inventory(cwd: string, current?: () => boolean): Promise<IsolatedInventory>;
 	recover(cwd: string): Promise<string>;
 	inspect(root: string, requestId: string): Promise<readonly string[]>;
@@ -493,7 +495,8 @@ export function registerIsolatedExtension(pi: ExtensionAPI, options: RegisterIso
 		if (!current() || sessionClosed) throw new Error("Session or branch changed; reopen /subagent.");
 	};
 	// FileRunStore emits the initial state only after fsync. A resumed run emits its
-	// recovery record after saving it. Neither the tool call nor its abort signal
+	// recovery record after saving it; validation acknowledges its saved exact intent.
+	// Neither the tool call nor its abort signal
 	// owns productive work after that durable boundary.
 	const startInSession = async (
 		id: string,
@@ -608,7 +611,7 @@ export function registerIsolatedExtension(pi: ExtensionAPI, options: RegisterIso
 					reject(error);
 					return;
 				}
-				deliver("terminal", `Pi Subagent ${id} stopped: ${boundedPublicText(error instanceof Error ? error.message : String(error))}. Use subagent_status to inspect the durable request and subagent_resume or subagent_abort for recovery.`);
+				deliver("terminal", `Pi Subagent ${id} stopped: ${boundedPublicText(error instanceof Error ? error.message : String(error))}. Use subagent_status to inspect the durable request before choosing an explicit recovery action.`);
 			},
 		);
 		const state = await durable;
@@ -616,16 +619,22 @@ export function registerIsolatedExtension(pi: ExtensionAPI, options: RegisterIso
 		return toolResult({ text: `Pi Subagent ${id}: durable request accepted; productive work continues. Use subagent_status to inspect progress.`, state }, ctx, workspaceRowsByRequest);
 	};
 
+	// Status stays callable from codemode scripts and hands them the same bounded public projection
+	// the model reads; every mutating tool below is model-only because its guarded transitions need
+	// Main's visible reasoning.
 	pi.registerTool({
 		name: "subagent_status",
 		label: "Subagent status",
 		description: "Read one durable isolated request without reconciling or changing resources.",
 		parameters: IdOnlySchema,
 		prepareArguments: parseIdOnly,
+		outputSchema: StatusOutputSchema,
 		async execute(_toolCallId, params, signal, _onUpdate, ctx) {
 			latestCtx = ctx;
 			const root = await lookupRoot(ctx.cwd, signal);
-			return toolResult(await getComponents().runner.status(params.id, root, signal), ctx, workspaceRowsByRequest);
+			const result = toolResult(await getComponents().runner.status(params.id, root, signal), ctx, workspaceRowsByRequest);
+			// The projection is plain JSON; its conditional fields are typed optional rather than absent.
+			return { ...result, structuredContent: result.details as JsonValue };
 		},
 	});
 	pi.registerTool({
@@ -634,6 +643,7 @@ export function registerIsolatedExtension(pi: ExtensionAPI, options: RegisterIso
 		description: "Resume one unfinished isolated request without resetting its recorded policy or correction count.",
 		parameters: ResumeRequestParameters,
 		prepareArguments: parseResumeRequest,
+		exposure: "model-only",
 		async execute(_toolCallId, params, signal, _onUpdate, ctx) {
 			latestCtx = ctx;
 			const root = await lookupRoot(ctx.cwd, signal);
@@ -649,6 +659,7 @@ export function registerIsolatedExtension(pi: ExtensionAPI, options: RegisterIso
 		description: "Main stages/resolves an exact candidate, or rejects/revises one. Rejection of a staged candidate freezes the old generation; explicitly restage chosen candidates in a new generation. Never writes Main.",
 		parameters: StageRequestSchema,
 		prepareArguments: parseStageRequest,
+		exposure: "model-only",
 		async execute(_toolCallId, params, signal, _onUpdate, ctx) {
 			latestCtx = ctx;
 			const root = await lookupRoot(ctx.cwd, signal);
@@ -658,12 +669,22 @@ export function registerIsolatedExtension(pi: ExtensionAPI, options: RegisterIso
 	pi.registerTool({
 		name: "subagent_integrate",
 		label: "Subagent integrate",
-		description: "Main advances staged dependents, refreshes after clean Main drift, validates, corrects, promotes, reconciles an interrupted promotion, cleans up promoted resources, or explicitly releases rejected/superseded owned resources. Never replays an uncertain mutation.",
+		description: "Main advances staged dependents, refreshes after clean Main drift or evidence-less validation failure, validates in the background, corrects, promotes, reconciles interrupted validation/promotion, cleans up promoted resources, or explicitly releases rejected/superseded owned resources. Never replays an uncertain mutation.",
 		parameters: IntegrationActionParameters,
 		prepareArguments: parseIntegrationAction,
+		exposure: "model-only",
 		async execute(_toolCallId, params, signal, _onUpdate, ctx) {
 			latestCtx = ctx;
 			const root = await lookupRoot(ctx.cwd, signal);
+			if (params.action === "validate") {
+				return await startInSession(params.id, root, signal, ctx,
+					(state) => {
+						const generation = state.integration.generations.at(-1);
+						return generation?.number === params.generation && generation.status === "validating"
+							&& sameIdentity(generation.combinedTip!, params.expectedTip);
+					},
+					(runSignal) => getComponents().runner.integrate(params, root, runSignal));
+			}
 			if (params.action === "advance") {
 				return await startInSession(params.id, root, signal, ctx,
 					(state) => state.status === "running" && state.waves.at(-1)?.status === "dispatching"
@@ -679,6 +700,7 @@ export function registerIsolatedExtension(pi: ExtensionAPI, options: RegisterIso
 		description: "Abort an isolated request; reject and release retained candidates and integration checkouts first. Terminate only exact owned workers. Repeat abort to reconcile cleanup of unchanged no-candidate allocations; preserve dirty or committed work.",
 		parameters: IdOnlySchema,
 		prepareArguments: parseIdOnly,
+		exposure: "model-only",
 		async execute(_toolCallId, params, signal, _onUpdate, ctx) {
 			latestCtx = ctx;
 			const root = await lookupRoot(ctx.cwd, signal);
@@ -755,10 +777,9 @@ export function registerIsolatedExtension(pi: ExtensionAPI, options: RegisterIso
 			requireCurrent(current);
 			return getComponents().runner.drainFollowups(root, requestId, taskId);
 		},
-		async execute(params, signal, ctx) {
+		async execute(request, signal, ctx) {
 			latestCtx = ctx;
 			latestContext();
-			const request = parseExecuteRequest(params);
 			const root = await lookupRoot(ctx.cwd, signal);
 			return await startInSession(request.id, root, signal, ctx,
 				(state) => state.status === "pending" && state.createdAt === state.updatedAt

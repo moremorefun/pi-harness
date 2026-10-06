@@ -116,7 +116,7 @@ export type PullRequestObservation = {
 	target: { repository: string; branch: string; remote: string; ref: string };
 };
 
-export type PullRequestLoadContext = { cwd: string; signal?: AbortSignal };
+export type PullRequestLoadContext = { cwd: string; signal?: AbortSignal; rebaseBranch?: string };
 
 type PullRequestCreationPreflight = {
 	head: string;
@@ -861,10 +861,11 @@ function conditions(
 		? "pending"
 		: "ready";
 	const behind = candidate.mergeStateStatus === "BEHIND";
+	const conflict = candidate.mergeable === "CONFLICTING" || candidate.mergeStateStatus === "DIRTY";
 	return {
 		draft: candidate.isDraft,
 		baseUpdateRequired: behind,
-		conflict: candidate.mergeable === "CONFLICTING" || candidate.mergeStateStatus === "DIRTY",
+		conflict,
 		changesRequested: candidate.reviewDecision === "CHANGES_REQUESTED",
 		unresolvedThreads,
 		ci: ciStatus(candidate.checkStates),
@@ -872,6 +873,10 @@ function conditions(
 		policy: candidate.mergeable === "MERGEABLE" && candidate.mergeStateStatus === "CLEAN"
 			? "ready"
 			: "pending",
+		// A confirmed conflict on either field is definitive; the other field's UNKNOWN is not worth waiting for.
+		mergeability: !conflict && (candidate.mergeable === "UNKNOWN" || candidate.mergeStateStatus === "UNKNOWN")
+			? "pending"
+			: "known",
 	};
 }
 
@@ -1365,7 +1370,9 @@ async function readPushTarget(
 	if (worktree.code !== 0) commandFailure("Check Git worktree", worktree);
 	if (worktreeOutput !== "true\n") fail("Check Git worktree", "invalid response");
 
-	const branchResult = await execute(pi, context, "Read current branch", "git", ["branch", "--show-current"]);
+	const branchResult = context.rebaseBranch === undefined
+		? await execute(pi, context, "Read current branch", "git", ["branch", "--show-current"])
+		: { stdout: `${context.rebaseBranch}\n` };
 	if (branchResult.stdout === "") return { kind: "blocked", issue: "detached" };
 	let branch: string;
 	try {
