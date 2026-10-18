@@ -3,7 +3,7 @@ import { readFileSync } from "node:fs";
 import { mkdir, readFile } from "node:fs/promises";
 import { join } from "node:path";
 import { setTimeout as delay } from "node:timers/promises";
-import { createConfigStore, extensionConfigDir, writePrivateTextFileAtomically } from "@henryqw/pi-config-store";
+import { createConfigStore, extensionConfigDir, field, parsers, registerConfigReporting, writePrivateTextFileAtomically } from "@henryqw/pi-config-store";
 import { lock } from "proper-lockfile";
 import {
 	createAssistantMessageEventStream,
@@ -76,7 +76,6 @@ type UsageState = {
 };
 
 type ParsedUsage = { remaining: number; reset: number; fiveHourReset?: number; limitedUntil?: number; tier?: string };
-type Config = { autoSwitchOn429: boolean };
 
 const NATIVE_PROVIDER_ID = "openai-codex";
 const CODEX_ALIAS_PATTERN = /^openai-codex-([2-9]|[1-9]\d+)$/;
@@ -91,13 +90,6 @@ const CACHE_MUTEX_RETRY_MS = 20;
 const CLEANUP_TIMEOUT_MS = 250;
 const cachePath = () => join(extensionConfigDir("pi-multi-codex"), "usage.json");
 const cacheMutexPath = () => `${cachePath()}.mutex`;
-
-function parseConfig(value: unknown): Config {
-	if (!isRecord(value) || Object.keys(value).length !== 1 || typeof value.autoSwitchOn429 !== "boolean") {
-		throw new Error("Config must contain only autoSwitchOn429:boolean.");
-	}
-	return { autoSwitchOn429: value.autoSwitchOn429 };
-}
 
 function isRecord(value: unknown): value is JsonRecord {
 	return typeof value === "object" && value !== null && !Array.isArray(value);
@@ -260,7 +252,6 @@ async function loadState(signal?: AbortSignal): Promise<UsageState> {
 
 async function saveState(state: UsageState, signal?: AbortSignal): Promise<void> {
 	signal?.throwIfAborted();
-	if (state.untrusted) return;
 	const file = cachePath();
 	const data = `${JSON.stringify({
 		slots: [...state.slots.values()].sort((a, b) => a.slot - b.slot),
@@ -272,11 +263,11 @@ async function saveState(state: UsageState, signal?: AbortSignal): Promise<void>
 async function withCacheMutex<T>(operation: (signal: AbortSignal) => Promise<T>, signal?: AbortSignal): Promise<T> {
 	signal?.throwIfAborted();
 	await mkdir(extensionConfigDir("pi-multi-codex"), { recursive: true, mode: 0o700 });
-	let release: (() => Promise<void>) | undefined;
-	while (!release) {
+	const compromised = new AbortController();
+	let release: () => Promise<void>;
+	for (;;) {
 		signal?.throwIfAborted();
 		try {
-			const compromised = new AbortController();
 			release = await lock(cachePath(), {
 				lockfilePath: cacheMutexPath(),
 				realpath: false,
@@ -285,19 +276,19 @@ async function withCacheMutex<T>(operation: (signal: AbortSignal) => Promise<T>,
 				retries: 0,
 				onCompromised: (error) => compromised.abort(error),
 			});
-			const operationSignal = signal ? AbortSignal.any([signal, compromised.signal]) : compromised.signal;
-			try {
-				operationSignal.throwIfAborted();
-				return await raceWithSignal(operation(operationSignal), operationSignal);
-			} finally {
-				await release().catch(() => undefined);
-			}
+			break;
 		} catch (error) {
 			if (!(error && typeof error === "object" && "code" in error && String(error.code) === "ELOCKED")) throw error;
 			await delay(CACHE_MUTEX_RETRY_MS, undefined, { signal, ref: false });
 		}
 	}
-	throw new Error("Cache mutex acquisition ended unexpectedly.");
+	const operationSignal = signal ? AbortSignal.any([signal, compromised.signal]) : compromised.signal;
+	try {
+		operationSignal.throwIfAborted();
+		return await raceWithSignal(operation(operationSignal), operationSignal);
+	} finally {
+		await release().catch(() => undefined);
+	}
 }
 
 function isMeasured(snapshot: UsageSnapshot | undefined): snapshot is MeasuredSnapshot {
@@ -434,15 +425,10 @@ class CodexQuotaStatus {
 
 	private change<T>(change: (state: UsageState) => { value: T; write: boolean }, signal?: AbortSignal): Promise<T | undefined> {
 		const operation = this.writes.then(() => withCacheMutex(async (operationSignal) => {
-			operationSignal.throwIfAborted();
 			const state = await loadState(operationSignal);
-			operationSignal.throwIfAborted();
 			if (state.untrusted) return undefined;
 			const result = change(state);
-			if (result.write) {
-				operationSignal.throwIfAborted();
-				await saveState(state, operationSignal);
-			}
+			if (result.write) await saveState(state, operationSignal);
 			return result.value;
 		}, signal));
 		this.writes = operation.then(() => undefined, () => undefined);
@@ -468,7 +454,6 @@ class CodexQuotaStatus {
 		const refresh = this.refreshContext;
 		if (!refresh) return;
 		void this.refreshDue(refresh)
-			.catch(() => undefined)
 			.then(() => {
 				if (this.refreshContext === refresh) this.scheduleRefresh();
 			});
@@ -507,20 +492,21 @@ class CodexQuotaStatus {
 			this.timer = undefined;
 			if (this.refreshContext === refresh) this.requestRefresh();
 		}, delay);
-		this.timer.unref?.();
+		this.timer.unref();
 	}
 
 	private async refreshDue(refresh: QuotaRefresh): Promise<void> {
 		const credentials = readCodexCredentials();
 		const state = await this.state();
-		await Promise.all([...credentials.entries()].map(async ([slot, credential]) => {
-			if (this.refreshContext !== refresh || this.active.has(slot)) return;
+		const now = Date.now();
+		for (const [slot, credential] of credentials) {
+			if (this.refreshContext !== refresh || this.active.has(slot)) continue;
 			const identity = identityFor(credential);
-			if (!identity) return;
+			if (!identity) continue;
 			const snapshot = state.slots.get(slot);
-			if (isFresh(snapshot, identity, Date.now()) || checkedRecently(snapshot, identity, Date.now())) return;
+			if (isFresh(snapshot, identity, now) || checkedRecently(snapshot, identity, now)) continue;
 			this.launch(slot, identity, refresh);
-		})).catch(() => undefined);
+		}
 	}
 
 	private launch(slot: number, identity: SlotIdentity, refresh: QuotaRefresh): void {
@@ -569,7 +555,7 @@ class CodexQuotaStatus {
 				if (!kept) this.stopHeartbeat(slot, owner);
 			}).catch(() => this.stopHeartbeat(slot, owner));
 		}, HEARTBEAT_MS);
-		timer.unref?.();
+		timer.unref();
 		this.heartbeats.set(slot, { owner, timer });
 	}
 
@@ -662,7 +648,7 @@ class CodexQuotaStatus {
 				signal: fetchSignal,
 			});
 			if (!response.ok) throw new Error(`Codex usage request failed (${response.status}).`);
-			const usage = parseCodexUsage(await raceWithSignal(response.json(), fetchSignal));
+			const usage = parseCodexUsage(await response.json());
 			if (!usage) throw new Error("Codex usage response has no usable seven-day window.");
 			if (!this.identityStillCurrent(slot, identity.accountHash) || !(await this.stillOwn(slot, owner, identity.accountHash))) {
 				discard = true;
@@ -703,10 +689,6 @@ class CodexQuotaStatus {
 	}
 }
 
-function nativeModel(model: CodexModel): CodexModel {
-	return model.provider === NATIVE_PROVIDER_ID ? model : { ...model, provider: NATIVE_PROVIDER_ID };
-}
-
 function aliasModel(model: CodexModel, provider: string): CodexModel {
 	return model.provider === provider ? model : { ...model, provider };
 }
@@ -717,10 +699,7 @@ function nativeContext(context: TranscriptContext, alias: string): TranscriptCon
 		messages: context.messages.map((message) => {
 			if (message.role !== "assistant") return message;
 			const provider = message.provider === alias ? NATIVE_PROVIDER_ID : message.provider === NATIVE_PROVIDER_ID ? alias : message.provider;
-			if (provider === message.provider) return message;
-			const rewritten = { ...message, provider };
-			if (message.deferred) rewritten.deferred = { ...message.deferred, provider };
-			return rewritten;
+			return provider === message.provider ? message : aliasMessage(message, provider);
 		}),
 	};
 }
@@ -788,28 +767,28 @@ export function createCodexAliasProvider(native: CodexProvider, slot: number): C
 		auth: native.auth,
 		getModels: () => models,
 		stream: (model, context, options?: ApiStreamOptions<"openai-codex-responses">) =>
-			aliasStream(native.stream(nativeModel(model), nativeContext(context, providerId), options), model, providerId),
+			aliasStream(native.stream(aliasModel(model, NATIVE_PROVIDER_ID), nativeContext(context, providerId), options), model, providerId),
 		streamSimple: (model, context, options?: SimpleStreamOptions) =>
-			aliasStream(native.streamSimple(nativeModel(model), nativeContext(context, providerId), options), model, providerId),
+			aliasStream(native.streamSimple(aliasModel(model, NATIVE_PROVIDER_ID), nativeContext(context, providerId), options), model, providerId),
 	};
 
 	if (native.filterModels) {
 		provider.filterModels = (available, credential) =>
 			native
-				.filterModels!(available.map(nativeModel), credential)
+				.filterModels!(available.map((model) => aliasModel(model, NATIVE_PROVIDER_ID)), credential)
 				.map((model) => aliasModel(model, providerId));
 	}
 	if (native.fetchDeferred) {
 		provider.fetchDeferred = (model, handle, options?: DeferredFetchOptions) =>
 			aliasStream(
-				native.fetchDeferred!(nativeModel(model), { ...handle, provider: NATIVE_PROVIDER_ID }, options),
+				native.fetchDeferred!(aliasModel(model, NATIVE_PROVIDER_ID), { ...handle, provider: NATIVE_PROVIDER_ID }, options),
 				model,
 				providerId,
 			);
 	}
 	if (native.cancelDeferred) {
 		provider.cancelDeferred = (model, handle, options?: DeferredCancelOptions) =>
-			native.cancelDeferred!(nativeModel(model), { ...handle, provider: NATIVE_PROVIDER_ID }, options);
+			native.cancelDeferred!(aliasModel(model, NATIVE_PROVIDER_ID), { ...handle, provider: NATIVE_PROVIDER_ID }, options);
 	}
 	return provider;
 }
@@ -824,20 +803,20 @@ function isManagedModel(model: Model<any> | undefined): model is CodexModel {
 }
 
 function sessionHasAgentWork(ctx: ExtensionContext): boolean {
-	return ctx.sessionManager?.getBranch?.().some((entry) =>
+	return ctx.sessionManager.getBranch().some((entry) =>
 		entry.type === "message" || (entry.type === "custom" && entry.customType === AGENT_STARTED_ENTRY),
-	) ?? false;
+	);
 }
 
 export default function multiCodex(pi: ExtensionAPI): void {
 	const native = builtinProviders().find((provider) => provider.id === NATIVE_PROVIDER_ID) as CodexProvider | undefined;
 	if (!native) return;
 	const quota = new CodexQuotaStatus();
-	const configStore = createConfigStore<Config>({
+	const configStore = createConfigStore({
 		extensionId: "pi-multi-codex",
-		defaults: () => ({ autoSwitchOn429: true }),
-		parse: parseConfig,
+		fields: { autoSwitchOn429: field(parsers.boolean(), true) },
 	});
+	registerConfigReporting(pi, [configStore]);
 	const registered = new Map<number, CodexProvider>();
 	const triedSlots = new Set<number>();
 	let sessionContext: ExtensionContext | undefined;
@@ -846,7 +825,6 @@ export default function multiCodex(pi: ExtensionAPI): void {
 	let preserveModelChoice = false;
 	let selectingAutomatically = false;
 	let autoSwitchOn429 = true;
-	let configWarned = false;
 	let providerRequest: { provider?: string; status?: number } | undefined;
 
 	const registerSlot = (slot: number): void => {
@@ -863,7 +841,7 @@ export default function multiCodex(pi: ExtensionAPI): void {
 	};
 
 	const allowsModel = (ctx: ExtensionContext, model: Model<any>, slot: number): boolean => {
-		const scopedModels = ctx.scopedModels ?? [];
+		const scopedModels = ctx.scopedModels;
 		return scopedModels.length === 0 || scopedModels.some(({ model: scoped }) => scoped.provider === providerForSlot(slot) && scoped.id === model.id);
 	};
 
@@ -919,17 +897,17 @@ export default function multiCodex(pi: ExtensionAPI): void {
 		const now = Date.now();
 		if (isFiveHourLimited(snapshot, now)) {
 			const text = `${prefix} · 5h limit · ${formatDuration(snapshot.limitedUntil! - now)}`;
-			return ctx.ui.theme?.fg ? ctx.ui.theme.fg("error", text) : text;
+			return ctx.ui.theme.fg("error", text);
 		}
 		if (!isFresh(snapshot, identity, now)) return `${prefix} · stale`;
 		const display = displayedReset(snapshot, now);
 		const text = `${prefix} · ${formatPercent(snapshot.remaining)}% · ${display.label} ${formatDuration(display.time - now)}`;
 		const color = snapshot.remaining >= 50 ? "success" : snapshot.remaining >= 25 ? "warning" : "error";
-		return ctx.ui.theme?.fg ? ctx.ui.theme.fg(color, text) : text;
+		return ctx.ui.theme.fg(color, text);
 	};
 
 	const updateFooter = (ctx: ExtensionContext | undefined = sessionContext): void => {
-		if (ctx) ctx.ui.setStatus?.("pi-multi-codex", footerText(ctx));
+		if (ctx) ctx.ui.setStatus("pi-multi-codex", footerText(ctx));
 	};
 
 	const setModelAutomatically = async (model: Model<any>): Promise<boolean> => {
@@ -962,15 +940,11 @@ export default function multiCodex(pi: ExtensionAPI): void {
 		triedSlots.clear();
 		providerRequest = undefined;
 		preserveModelChoice = false;
-		try {
-			autoSwitchOn429 = configStore.loadSync().value.autoSwitchOn429;
-		} catch {
-			autoSwitchOn429 = false;
-			if (!configWarned) {
-				configWarned = true;
-				ctx.ui.notify("Pi Multi Codex config is invalid. Automatic 429 switching is disabled; the file was left unchanged.", "warning");
-			}
-		}
+		// registerConfigReporting shows any issues. A file-level problem or an invalid or misspelled
+		// `autoSwitchOn429` keeps switching off; a missing file uses the default.
+		const config = configStore.loadSync();
+		autoSwitchOn429 = config.status === "ok" && config.value.autoSwitchOn429
+			&& !config.issues.some(({ key }) => key === "" || key === "autoSwitchOn429");
 		automaticOpen = isManagedModel(ctx.model) && !sessionHasAgentWork(ctx);
 		automaticCandidate = ctx.model;
 		// Cache-only ranking happens before background refresh starts.
@@ -1099,10 +1073,8 @@ export default function multiCodex(pi: ExtensionAPI): void {
 				return;
 			}
 
-			const authenticated = [...syncSlots()]
-				.filter((slot) => slot === 1 || registered.has(slot))
-				.sort((left, right) => left - right);
-			const scopedModels = ctx.scopedModels ?? [];
+			const authenticated = [...syncSlots()].sort((left, right) => left - right);
+			const scopedModels = ctx.scopedModels;
 			const slots = authenticated.filter((slot) => allowsModel(ctx, model, slot));
 			const currentSlot = slotForProvider(model.provider);
 			if (slots.length === 0 || (scopedModels.length > 0 && authenticated.some((slot) => !allowsModel(ctx, model, slot)) && slots.every((slot) => slot === currentSlot))) {

@@ -380,7 +380,7 @@ function transientLaunch(cleanup: () => Promise<void> = async () => {}): {
 function lsof(path: string, stdout = "", code = stdout ? 0 : 1, pid?: number): Step {
 	return {
 		command: "lsof-test",
-		args: ["-nP", "-a", ...(pid === undefined ? [] : ["-p", String(pid)]), "-F", "p", "--", path],
+		args: ["-w", "-nP", "-a", ...(pid === undefined ? [] : ["-p", String(pid)]), "-F", "p", "--", path],
 		result: { code, stdout, stderr: "" },
 	};
 }
@@ -463,9 +463,9 @@ function currentWorkspaceResult(paths: Paths, worktreeOverrides: Record<string, 
 	});
 }
 
-function preflightSteps(paths: Paths, schemaValue = schema(), status = "status: running\nversion: 0.9.0\nendpoint_compatible: yes\nprivate_protocol: 22\nprivate_protocol_compatible: yes\n"): Step[] {
+function preflightSteps(paths: Paths, schemaValue = schema(), status = "status: running\nversion: 0.9.3\nendpoint_compatible: yes\nprivate_protocol: 22\nprivate_protocol_compatible: yes\n"): Step[] {
 	return [
-		{ command: "herdr", args: ["--version"], result: { code: 0, stdout: "herdr 0.9.0\n", stderr: "" } },
+		{ command: "herdr", args: ["--version"], result: { code: 0, stdout: "herdr 0.9.3\n", stderr: "" } },
 		{ command: "herdr", args: ["status", "server"], result: { code: 0, stdout: status, stderr: "" } },
 		{ command: "herdr", args: ["api", "schema", "--json"], result: { code: 0, stdout: JSON.stringify(schemaValue), stderr: "" } },
 		{ command: "lsof-test", args: ["-v"], result: { code: 0, stdout: "lsof 4.99", stderr: "" } },
@@ -554,10 +554,10 @@ test("preflight accepts linked Main only after Herdr capabilities and current-wo
 	});
 
 	for (const [name, mutate, error] of [
-		["old client", (steps: Step[]) => { (steps[0]!.result as ProcessResult).stdout = "herdr 0.8.9\n"; }, /client version/],
-		["prerelease client", (steps: Step[]) => { (steps[0]!.result as ProcessResult).stdout = "herdr 0.9.0-beta.1\n"; }, /client version/],
-		["incompatible endpoint", (steps: Step[]) => { (steps[1]!.result as ProcessResult).stdout = "status: running\nversion: 0.9.0\nendpoint_compatible: no\nprivate_protocol: 22\nprivate_protocol_compatible: yes\n"; }, /server must be compatible/],
-		["old protocol", (steps: Step[]) => { (steps[1]!.result as ProcessResult).stdout = "status: running\nversion: 0.9.0\nendpoint_compatible: yes\nprivate_protocol: 21\nprivate_protocol_compatible: yes\n"; }, /protocol >=22/],
+		["old client", (steps: Step[]) => { (steps[0]!.result as ProcessResult).stdout = "herdr 0.9.2\n"; }, /client version/],
+		["prerelease client", (steps: Step[]) => { (steps[0]!.result as ProcessResult).stdout = "herdr 0.9.3-beta.1\n"; }, /client version/],
+		["incompatible endpoint", (steps: Step[]) => { (steps[1]!.result as ProcessResult).stdout = "status: running\nversion: 0.9.3\nendpoint_compatible: no\nprivate_protocol: 22\nprivate_protocol_compatible: yes\n"; }, /server must be compatible/],
+		["old protocol", (steps: Step[]) => { (steps[1]!.result as ProcessResult).stdout = "status: running\nversion: 0.9.3\nendpoint_compatible: yes\nprivate_protocol: 21\nprivate_protocol_compatible: yes\n"; }, /protocol >=22/],
 		["missing env capability", (steps: Step[]) => { steps[2]!.result = {
 			code: 0,
 			stdout: JSON.stringify(schema({
@@ -880,7 +880,7 @@ test("allocation uses token-bound non-focused resources, a mode-0600 lease, and 
 		attempt,
 		acquireLaunch: async () => {
 			assert.deepEqual(script.calls.slice(-3).map(({ command, args }) => [command, ...args]), [
-				["lsof-test", "-nP", "-a", "-F", "p", "--", tabDetails.leasePath],
+				["lsof-test", "-w", "-nP", "-a", "-F", "p", "--", tabDetails.leasePath],
 				["herdr", "pane", "get", WORKER_PANE_ID],
 				["herdr", "pane", "process-info", "--pane", WORKER_PANE_ID],
 			]);
@@ -935,7 +935,7 @@ test("agent allocation accepts the task's explicit Role and rejects launch misma
 				attempt,
 				acquireLaunch: async () => {
 					assert.deepEqual(script.calls.slice(-3).map(({ command, args }) => [command, ...args]), [
-						["lsof-test", "-nP", "-a", "-F", "p", "--", leasePath],
+						["lsof-test", "-w", "-nP", "-a", "-F", "p", "--", leasePath],
 						["herdr", "pane", "get", WORKER_PANE_ID],
 						["herdr", "pane", "process-info", "--pane", WORKER_PANE_ID],
 					]);
@@ -1647,7 +1647,7 @@ test("worker prompts preserve ordered upstream task data and reject oversized fu
 	script.done();
 });
 
-test("initial and correction prompts include the exact request goal", async (t) => {
+test("initial and correction prompts include the exact request goal and Main's correction instruction", async (t) => {
 	const fixture = await paths(t);
 	const script = new ScriptedProcess();
 	let inspections = 0;
@@ -1681,7 +1681,7 @@ test("initial and correction prompts include the exact request goal", async (t) 
 		{ command: "herdr", args: (args) => {
 			assert.deepEqual(args.slice(0, 3), ["agent", "prompt", AGENT_NAME]);
 			assert.ok(args[3]!.includes(`Goal:\n${GOAL}\nWorktree:`));
-			assert.ok(args[3]!.includes("Correction failure:\nA declared check failed."));
+			assert.ok(args[3]!.includes("Correction failure:\nA declared check failed.\n\nMain's instruction:\nFix the failing check."));
 		}, result: success({ type: "agent_prompted", agent: agentInfo("done", true, { cwd: fixture.worktree }) }) },
 		{ command: "herdr", args: ["agent", "read", AGENT_NAME, "--source", "recent", "--lines", "80", "--format", "text"], result: { code: 0, stdout: "corrected", stderr: "" } },
 	);
@@ -1694,6 +1694,7 @@ test("initial and correction prompts include the exact request goal", async (t) 
 		kind: "correction",
 		preCandidate: baseIdentity(),
 		failure: "A declared check failed.",
+		instruction: "Fix the failing check.",
 	}, operation);
 	assert.equal(correction.outcome, "candidate");
 	assert.equal(inspections, 2);
@@ -1827,31 +1828,34 @@ test("normal prompt accepts a changed clean candidate from real in-flight Git in
 	script.done();
 });
 
-test("finished worker without a commit reports blocked instead of waiting for a candidate", async (t) => {
-	const fixture = await paths(t);
-	const script = new ScriptedProcess();
-	const delays: number[] = [];
-	const host = runtime(fixture, script, async () => baseIdentity(), {
-		delay: async (milliseconds) => { delays.push(milliseconds); },
-		inspectInFlightTaskCandidate: async () => ({ candidate: baseIdentity(), clean: true, valid: true }),
+test("finished worker without a commit reports blocked, or uncommitted when its worktree is dirty", async (t) => {
+	for (const [clean, outcome] of [[true, "blocked"], [false, "uncommitted"]] as const) await t.test(outcome, async (t) => {
+		const fixture = await paths(t);
+		const script = new ScriptedProcess();
+		const delays: number[] = [];
+		const host = runtime(fixture, script, async () => baseIdentity(), {
+			delay: async (milliseconds) => { delays.push(milliseconds); },
+			inspectInFlightTaskCandidate: async () => ({ candidate: baseIdentity(), clean, valid: true }),
+		});
+		const { attempt } = await fullAttempt(fixture, host, script);
+		const lease = attempt.allocations.find((item): item is AgentAllocationIntent => item.kind === "agent")!.leasePath;
+		await privateLease(lease);
+		const prompt = `${buildChangesetTaskPrompt({ goal: GOAL, contexts: [], task, kind: "initial", worktreeCwd: fixture.worktree })}\n\nTurn identity: ${attempt.correlationToken}:${attempt.prompts.length}`;
+		await writeFile(`${lease}.session.jsonl`, [
+			JSON.stringify({ type: "message", id: "user-one", parentId: null, message: { role: "user", content: [{ type: "text", text: prompt }] } }),
+			JSON.stringify({ type: "message", id: "answer-one", parentId: "user-one", message: { role: "assistant", stopReason: "stop", content: [{ type: "text", text: "No safe change was made." }] } }),
+		].join("\n") + "\n", { mode: 0o600 });
+		script.push(
+			{ command: "herdr", args: () => {}, result: success({ type: "agent_info", agent: agentInfo("idle", true, { cwd: fixture.worktree }) }) },
+			{ command: "herdr", args: () => {}, result: success({ type: "agent_prompted", agent: agentInfo("working", true, { cwd: fixture.worktree }) }) },
+			{ command: "herdr", args: () => {}, result: success({ type: "agent_info", agent: agentInfo("idle", true, { cwd: fixture.worktree }) }) },
+		);
+		const result = await host.runWorker({ goal: GOAL, contexts: [], task, attempt, workerId: AGENT_NAME, kind: "initial", preCandidate: baseIdentity() }, context());
+		assert.equal(result.outcome, outcome);
+		assert.deepEqual(delays, []);
+		assert.equal(script.calls.filter(({ args }) => args[1] === "prompt").length, 1);
+		script.done();
 	});
-	const { attempt } = await fullAttempt(fixture, host, script);
-	const lease = attempt.allocations.find((item): item is AgentAllocationIntent => item.kind === "agent")!.leasePath;
-	await privateLease(lease);
-	const prompt = `${buildChangesetTaskPrompt({ goal: GOAL, contexts: [], task, kind: "initial", worktreeCwd: fixture.worktree })}\n\nTurn identity: ${attempt.correlationToken}:${attempt.prompts.length}`;
-	await writeFile(`${lease}.session.jsonl`, [
-		JSON.stringify({ type: "message", id: "user-one", parentId: null, message: { role: "user", content: [{ type: "text", text: prompt }] } }),
-		JSON.stringify({ type: "message", id: "answer-one", parentId: "user-one", message: { role: "assistant", stopReason: "stop", content: [{ type: "text", text: "No safe change was made." }] } }),
-	].join("\n") + "\n", { mode: 0o600 });
-	script.push(
-		{ command: "herdr", args: () => {}, result: success({ type: "agent_info", agent: agentInfo("idle", true, { cwd: fixture.worktree }) }) },
-		{ command: "herdr", args: () => {}, result: success({ type: "agent_prompted", agent: agentInfo("working", true, { cwd: fixture.worktree }) }) },
-		{ command: "herdr", args: () => {}, result: success({ type: "agent_info", agent: agentInfo("idle", true, { cwd: fixture.worktree }) }) },
-	);
-	const result = await host.runWorker({ goal: GOAL, contexts: [], task, attempt, workerId: AGENT_NAME, kind: "initial", preCandidate: baseIdentity() }, context());
-	assert.equal(result.outcome, "blocked");
-	assert.deepEqual(delays, []);
-	script.done();
 });
 
 test("an exact failed terminal turn without a commit reports attention after a stalled prompt", async (t) => {
@@ -2234,7 +2238,7 @@ test("termination closes only the saved pane and rechecks every exact lease PID 
 	});
 	script.push(
 		...terminationPrefix(fixture),
-		lsof(leasePath, "p101\np202\n"),
+		lsof(leasePath, "p101\nf0\np202\nfcwd\n"),
 		lsof(leasePath, "p101\n", 0, 101),
 		lsof(leasePath, "", 1, 202),
 		lsof(leasePath, "p101\n"),
@@ -2246,6 +2250,24 @@ test("termination closes only the saved pane and rechecks every exact lease PID 
 	assert.deepEqual(kills, [[101, "SIGTERM"], [101, "SIGKILL"]]);
 	assert.deepEqual(delays, [250, 100, 50]);
 	assert.ok(!JSON.stringify(script.calls).includes("secret must not be logged"));
+	script.done();
+});
+
+test("termination of a live worker whose checkout was removed queries Herdr and lsof from the lease directory", async (t) => {
+	const fixture = await paths(t);
+	const script = new ScriptedProcess();
+	const { attempt, leasePath } = await fullAttempt(fixture, runtime(fixture, script), script);
+	await privateLease(leasePath);
+	const host = new HerdrHostRuntime({
+		inspectInFlightTaskCandidate: async () => ({ candidate: changedIdentity(), clean: true, valid: true }),
+		runProcess: script.run, killProcess: () => {}, delay: async () => {}, now: () => 1_000,
+		env: {}, leaseDirectory: fixture.leases, lsofCommand: "lsof-test",
+	});
+	await rm(fixture.worktree, { recursive: true });
+	const before = script.calls.length;
+	script.push(...terminationPrefix(fixture), lsof(leasePath), lsof(leasePath));
+	assert.deepEqual(await host.terminateWorker({ task, attempt, workerId: AGENT_NAME, candidate: changedIdentity() }, context()), { outcome: "terminated" });
+	assert.ok(script.calls.slice(before).every(({ options }) => options.cwd === fixture.leases));
 	script.done();
 });
 
@@ -2272,7 +2294,7 @@ test("termination refuses a stale pane that no longer belongs to the exact saved
 });
 
 test("termination reconciliation proves exact active or absent worker state", async (t) => {
-	for (const expected of ["active", "terminated"] as const) {
+	for (const expected of ["active", "terminated", "checkout removed"] as const) {
 		await t.test(expected, async (t) => {
 			const fixture = await paths(t);
 			const script = new ScriptedProcess();
@@ -2290,6 +2312,9 @@ test("termination reconciliation proves exact active or absent worker state", as
 				leaseDirectory: fixture.leases,
 				lsofCommand: "lsof-test",
 			});
+			// A worker checkout removed outside Pi Subagent cannot be the cwd of the global Herdr and lsof queries.
+			if (expected === "checkout removed") await rm(fixture.worktree, { recursive: true });
+			const before = script.calls.length;
 			script.push({ command: "herdr", args: ["agent", "list"], result: success({
 				type: "agent_list",
 				agents: expected === "active" ? [agentInfo("idle", true, { cwd: fixture.worktree })] : [],
@@ -2310,8 +2335,9 @@ test("termination reconciliation proves exact active or absent worker state", as
 			}
 			assert.deepEqual(await host.reconcileWorkerTermination({
 				task, attempt, workerId: AGENT_NAME, candidate: changedIdentity(),
-			}, context()), { outcome: expected });
-			assert.deepEqual(delays, expected === "terminated" ? [50] : []);
+			}, context()), { outcome: expected === "active" ? "active" : "terminated" });
+			assert.deepEqual(delays, expected === "active" ? [] : [50]);
+			if (expected === "checkout removed") assert.ok(script.calls.slice(before).every(({ options }) => options.cwd === fixture.leases));
 			script.done();
 		});
 	}
@@ -2355,7 +2381,7 @@ test("termination quarantines ambiguity, late holders, and survivors without sig
 	const { attempt, leasePath } = await fullAttempt(fixture, seed, script);
 	await privateLease(leasePath);
 	script.push(...terminationPrefix(fixture), {
-		command: "lsof-test", args: ["-nP", "-a", "-F", "p", "--", leasePath],
+		command: "lsof-test", args: ["-w", "-nP", "-a", "-F", "p", "--", leasePath],
 		result: { code: 2, stdout: "", stderr: "ambiguous" },
 	});
 	const host = new HerdrHostRuntime({

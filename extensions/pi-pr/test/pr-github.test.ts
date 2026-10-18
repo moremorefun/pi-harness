@@ -10,6 +10,7 @@ import {
 	loadCurrentPullRequest as discoverCurrentPullRequest,
 	preflightPullRequestCreation,
 	PullRequestLoadError,
+	readPullRequestBaseRefOid,
 } from "../extensions/pr-github.ts";
 
 async function loadCurrentPullRequest(
@@ -56,6 +57,8 @@ type HarnessOptions = {
 	fetchUrlResult?: ReturnType<typeof result>;
 	pushRepositoryResult?: ReturnType<typeof result>;
 	remoteHead?: string | null;
+	remoteListResult?: ReturnType<typeof result>;
+	githubHosts?: string[];
 	remoteHeads?: Record<string, string | null>;
 	configValues?: Record<string, string[]>;
 	remoteHeadResult?: ReturnType<typeof result>;
@@ -76,6 +79,8 @@ type HarnessOptions = {
 	creationFetchResult?: ReturnType<typeof result>;
 	creationDefaultBranch?: string;
 	repositoryApiResults?: Record<string, ReturnType<typeof result>>;
+	codexReactions?: unknown[];
+	codexComments?: unknown[];
 };
 
 const result = (stdout = "", code = 0, stderr = "", killed = false) => ({ stdout, stderr, code, killed });
@@ -295,6 +300,18 @@ function harness(options: HarnessOptions = {}) {
 					: options.fetchUrls?.[requestedRemote] ?? (requestedRemote === remote ? options.fetchUrl : undefined) ?? defaultUrl;
 				return result(`${requestedUrl}\n`);
 			}
+			if (command === "git" && args.join(" ") === "remote -v") {
+				if (options.remoteListResult) return options.remoteListResult;
+				return result((options.remoteNames ?? [remote, "origin"]).map((name) => {
+					const url = options.pushUrls?.[name] ?? (name === remote ? pushUrl : `git@github.com:acme/${name}.git`);
+					return `${name}\t${url} (fetch)\n${name}\t${url} (push)\n`;
+				}).join(""));
+			}
+			if (command === "gh" && args.slice(0, 3).join(" ") === "auth token --hostname") {
+				return (options.githubHosts ?? ["github.com"]).includes(args[3] ?? "")
+					? result("token\n")
+					: result("", 1, `no oauth token found for ${args[3]}\n`);
+			}
 			if (command === "gh" && args[0] === "repo" && args[1] === "view") {
 				const [host, owner, name, ...rest] = (args[2] ?? "").split("/");
 				if (!host || !owner || !name || rest.length) throw new Error(`Unexpected repository locator: ${args[2]}`);
@@ -349,6 +366,12 @@ function harness(options: HarnessOptions = {}) {
 			}
 			if (command === "gh" && args[0] === "api" && args[1] === "--hostname") {
 				const endpoint = args.at(-1) ?? "";
+				if (options.codexReactions && endpoint === "repos/acme/project/issues/42/reactions?per_page=100") {
+					return result(JSON.stringify([options.codexReactions]));
+				}
+				if (options.codexComments && endpoint === "repos/acme/project/issues/42/comments?per_page=100") {
+					return result(JSON.stringify([options.codexComments]));
+				}
 				if (/^repos\/[^/]+\/[^/]+$/.test(endpoint)) {
 					const configuredResult = options.repositoryApiResults?.[endpoint];
 					if (configuredResult) return configuredResult;
@@ -807,6 +830,33 @@ test("stays inactive only after a C-locale safe-directory probe confirms no repo
 
 	assert.deepEqual(await discoverCurrentPullRequest(pi, context), { kind: "inactive" });
 	assert.equal(calls.some(({ args }) => args[0] === "branch"), false);
+});
+
+test("treats a repository with no GitHub-hosted remote as inactive", async () => {
+	for (const url of [
+		"ssh://git@192.168.192.3:9005/team/project.git",
+		"git@gitlab.internal.example:team/project.git",
+	]) {
+		const { pi, context, calls } = harness({ remoteListResult: result(`origin\t${url} (fetch)\norigin\t${url} (push)\n`) });
+		const host = url.startsWith("ssh:") ? "192.168.192.3" : "gitlab.internal.example";
+		assert.deepEqual(await discoverCurrentPullRequest(pi, context), { kind: "inactive", nonGitHubHosts: [host] }, url);
+		assert.equal(calls.some(({ command, args }) => command === "gh" && args[0] !== "auth"), false, url);
+		assert.equal(calls.some(({ command, args }) => command === "git" && args[0] === "branch"), false, url);
+	}
+});
+
+test("keeps GitHub and GitHub Enterprise remotes on the normal discovery path", async () => {
+	for (const { url, githubHosts } of [
+		{ url: "git@github.com:acme/fork.git", githubHosts: [] },
+		{ url: "ssh://git@ghe.example.com/acme/fork.git", githubHosts: ["ghe.example.com"] },
+		{ url: "/srv/git/fork.git", githubHosts: [] },
+	]) {
+		const app = harness({
+			githubHosts,
+			remoteListResult: result(`fork\t${url} (fetch)\norigin\tgit@gitea.example:acme/fork.git (push)\n`),
+		});
+		assert.equal((await discoverCurrentPullRequest(app.pi, app.context)).kind, "current", url);
+	}
 });
 
 test("surfaces repository errors and a later read recovers after the error is fixed", async () => {
@@ -1835,6 +1885,7 @@ test("keeps ordinary optional remote-authority failures as a blocked target", as
 test("fails visibly when remote push-ref authority errors or is malformed", async () => {
 	for (const candidate of [
 		{ result: result("", 1), error: /Read remote push ref failed: exit code 1/ },
+		{ result: result("", 2, "", true), error: /Read remote push ref failed: command timed out after 10000 ms/ },
 		{ result: result(`${REMOTE_HEAD}\trefs/heads/other\n`), error: /response does not match push ref/ },
 	]) {
 		const { pi, context } = harness({ remoteHeadResult: candidate.result });
@@ -2008,6 +2059,35 @@ test("requires a base update whenever GitHub reports the PR behind", async () =>
 	assert.equal(loaded.conditions.policy, "pending");
 });
 
+test("classifies killed base ref commands with the signal used for execution", async (t) => {
+	for (const scenario of ["timeout", "no signal", "abort", "abort then clear signal", "replace with aborted signal"]) {
+		await t.test(scenario, async () => {
+			const controller = new AbortController();
+			const signal = scenario === "no signal" ? undefined : controller.signal;
+			const context = { cwd: "/repo", signal };
+			const aborted = scenario.startsWith("abort");
+			const pi = {
+				exec: async (command: string, _args: string[], options?: CommandCall["options"]) => {
+					assert.equal(command, "gh");
+					assert.equal(options?.signal, signal);
+					assert.equal(options?.timeout, 10_000);
+					if (aborted) controller.abort();
+					if (scenario === "abort then clear signal") context.signal = undefined;
+					if (scenario === "replace with aborted signal") context.signal = AbortSignal.abort();
+					return result("", 0, "", true);
+				},
+			};
+			await assert.rejects(
+				readPullRequestBaseRefOid(pi, context, { host: "github.com", repository: "acme/project", ref: "main" }),
+				{
+					name: "PullRequestLoadError",
+					message: `Read base ref failed: ${aborted ? "command was cancelled" : "command timed out after 10000 ms"}`,
+				},
+			);
+		});
+	}
+});
+
 test("fails visibly when current base branch authority fails or is malformed", async () => {
 	const cases = [
 		{ name: "query failure", output: result("", 1), error: /Read base ref failed: exit code 1/ },
@@ -2178,4 +2258,59 @@ test("classifies behind, ahead, and diverged only after fetching the exact PR he
 		const compareIndex = calls.findIndex(({ command, args }) => command === "git" && args[0] === "merge-base");
 		assert.ok(fetchIndex >= 0 && compareIndex > fetchIndex, ancestry);
 	}
+});
+
+test("derives the opt-in Codex review gate from reactions, the current-head summary row, and P0/P1 threads", async () => {
+	const codex = { login: "chatgpt-codex-connector[bot]" };
+	const row = (status: string, sha: string) => `| 📝 **Code Review** | ${status} <relative-time datetime="2026-10-01T00:00:00Z"></relative-time> | \`${sha}\` | Manual request |`;
+	const summary = (...rows: string[]) => ({
+		user: codex,
+		body: `<!-- codex-pull-request-review-summary -->\n| Review | Status | Commit | Review trigger |\n| --- | --- | --- | --- |\n${rows.join("\n")}\n`,
+	});
+	const current = summary(row("✅ **Completed**", REMOTE_HEAD.slice(0, 7)));
+	const older = summary(row("✅ **Completed**", "36e8693"));
+	const cases: Array<{ name: string; reactions: unknown[]; comments?: unknown[]; status: "running" | "complete" }> = [
+		{ name: "EYES means running", reactions: [{ content: "+1", user: codex }, { content: "eyes", user: codex }], status: "running" },
+		{ name: "no Codex activity means running", reactions: [{ content: "+1", user: { login: "octocat" } }], comments: [], status: "running" },
+		{ name: "THUMBS_UP alone does not complete", reactions: [{ content: "+1", user: codex }], comments: [], status: "running" },
+		{ name: "THUMBS_UP with an older Completed row waits", reactions: [{ content: "+1", user: codex }], comments: [older], status: "running" },
+		{ name: "a Completed row for the current head completes", reactions: [], comments: [{ user: null, body: "note" }, current], status: "complete" },
+		{ name: "the latest row decides", reactions: [], comments: [summary(row("✅ **Completed**", REMOTE_HEAD.slice(0, 7)), row("⏳ **In progress**", REMOTE_HEAD.slice(0, 7)))], status: "running" },
+		{ name: "an unparseable summary means running", reactions: [], comments: [{ user: codex, body: "<!-- codex-pull-request-review-summary -->\nCode Review: Completed" }], status: "running" },
+		{ name: "another author's summary does not complete", reactions: [], comments: [{ user: { login: "octocat" }, body: current.body }], status: "running" },
+	];
+	for (const { name, reactions, comments, status } of cases) {
+		const app = harness({ codexReactions: reactions, codexComments: comments });
+		app.context.codexReview = true;
+		const loaded = await loadCurrentPullRequest(app.pi, app.context);
+		assert.deepEqual(loaded?.conditions.codex, { status, findings: 0 }, name);
+		assert.equal(app.calls.some(({ args }) => args.at(-1)?.includes("/comments?")), comments !== undefined, name);
+		assert.ok(app.calls.find(({ args }) => args.at(-1)?.includes("/reactions?"))?.args.includes("--paginate"), name);
+	}
+
+	const thread = (login: string, badge: string, isResolved = false) => ({
+		isResolved,
+		comments: { nodes: [{ author: { login }, body: `**![${badge} Badge](https://img.shields.io/badge/${badge}-orange?style=flat)** Fix it` }] },
+	});
+	const findings = harness({
+		codexReactions: [{ content: "+1", user: codex }],
+		codexComments: [current],
+		threads: reviewThreadOutput(reviewThreadPage([
+			thread("chatgpt-codex-connector", "P1"),
+			thread("chatgpt-codex-connector", "P0", true),
+			thread("chatgpt-codex-connector", "P2"),
+			thread("octocat", "P0"),
+			{ isResolved: false, comments: { nodes: [{ author: null, body: "deleted" }] } },
+		])),
+	});
+	findings.context.codexReview = true;
+	const blocked = await loadCurrentPullRequest(findings.pi, findings.context);
+	assert.equal(blocked?.conditions.unresolvedThreads, 4);
+	assert.deepEqual(blocked?.conditions.codex, { status: "complete", findings: 1 });
+	assert.ok(blocked && derivePullRequestNextStep({ ...blocked, local: { worktree: "clean", head: "equal" } }) === "sweep");
+	assert.match(findings.calls.find(({ args }) => args.some((arg) => arg.includes("reviewThreads")))?.args.join(" ") ?? "", /comments\(first:1\)/);
+
+	const invalid = harness({ codexReactions: [{ content: "eyes", user: "chatgpt-codex-connector[bot]" }] });
+	invalid.context.codexReview = true;
+	await assert.rejects(loadCurrentPullRequest(invalid.pi, invalid.context), /Read Codex review reactions failed: invalid GitHub CLI output/);
 });

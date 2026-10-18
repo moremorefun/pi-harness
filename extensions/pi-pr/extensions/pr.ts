@@ -1,6 +1,6 @@
 import { randomUUID } from "node:crypto";
-import { spawnBounded } from "@henryqw/pi-process";
-import { readFile, realpath } from "node:fs/promises";
+import { GitCommitter } from "./git-commit.ts";
+import { readFile } from "node:fs/promises";
 import { dirname } from "node:path";
 import {
 	isBashToolResult,
@@ -9,6 +9,7 @@ import {
 	type ExtensionContext,
 } from "@earendil-works/pi-coding-agent";
 import { truncateToWidth } from "@earendil-works/pi-tui";
+import { type ConfigLoad, registerConfigReporting } from "@henryqw/pi-config-store";
 import { createHerdrClient } from "@henryqw/pi-herdr";
 import { Type, type Static, type TObject, type TSchema, type TUnion } from "typebox";
 import { Check, Errors } from "typebox/value";
@@ -20,11 +21,12 @@ import {
 	WORKFLOW_ROUTES,
 	type PrCommandDependencies,
 	type PrCommandInvocation,
+	type PublicationRequest,
 	type WorkflowPromptIdentity,
 } from "./pr-command.ts";
 import { PullRequestCreator, type CreatePullRequestOptions } from "./pr-create.ts";
 import { PullRequestWorkPublisher } from "./pr-publish-work.ts";
-import { loadPrPolicy, PrRun } from "./pr-run.ts";
+import { createPrPolicyStore, DEFAULT_PR_POLICY, PrRun, type PrPolicy } from "./pr-run.ts";
 import {
 	GitHubRateLimitError,
 	loadCurrentPullRequest,
@@ -35,7 +37,7 @@ import {
 	samePullRequestObservation,
 	type PullRequestObservation,
 } from "./pr-github.ts";
-import { isRecord, parseSingleOutputLine, runChecked } from "./pr-execution.ts";
+import { canonicalWorktree, isRecord } from "./pr-execution.ts";
 import {
 	discoveryIssueDetails,
 	formatPrFooter,
@@ -47,6 +49,7 @@ import {
 import { inspectVerifiedRebaseRecovery, PullRequestBranchUpdater, type UpdateBranchOptions } from "./pr-update-branch.ts";
 
 const MAX_STALE_REDISCOVERIES = 2;
+const STALE_PR_REFRESH_MS = 2 * 60_000;
 const ROUTING_SPINNER_INTERVAL_MS = 80;
 const ROUTING_SPINNER_FRAMES = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
 const ROUTING_WIDGET_TEXT = "Checking pull request…";
@@ -76,6 +79,7 @@ const SweepLedgerEntry = Type.Object({
 	]),
 	disposition: Type.Union([Type.Literal("addressed"), Type.Literal("non-actionable"), Type.Literal("blocked")]),
 	note: Type.String({ maxLength: 2_048 }),
+	commit: Type.Optional(Type.String({ pattern: "^(?:[0-9a-f]{40}|[0-9a-f]{64})$" })),
 }, CLOSED);
 const SweepLedger = Type.Array(SweepLedgerEntry, { maxItems: 1_000 });
 const SweepChecks = Type.Array(Type.Object({
@@ -109,6 +113,10 @@ function checkedAction<T extends TUnion<TObject[]>>(actions: T, args: unknown): 
 	throw new Error(`Tool arguments do not match one action${issue ? `: ${issue.message}` : ""}`);
 }
 
+const CommitActions = Type.Union([
+	Type.Object({ action: Type.Literal("inspect"), target: Type.String({ minLength: 1, maxLength: 1_024 }) }, CLOSED),
+	Type.Object({ action: Type.Literal("commit"), inspectionId: RouteRunId, ownedPaths: OwnedPaths, message: Type.String({ minLength: 1, maxLength: 16_384 }) }, CLOSED),
+]);
 const UpdateBranchActions = Type.Union([
 	Type.Object({ runId: RouteRunId, action: Type.Literal("rebase") }, CLOSED),
 	Type.Object({ runId: RouteRunId, action: Type.Literal("continue"), resolvedPaths: ResolvedPaths }, CLOSED),
@@ -152,6 +160,10 @@ const WorkActions = Type.Union([
 	Type.Object({ runId: RouteRunId, action: Type.Literal("validate"), checks: SweepChecks }, CLOSED),
 	Type.Object({ runId: RouteRunId, action: Type.Literal("publish") }, CLOSED),
 ]);
+const PublicationParameters = Type.Object({
+	base: Type.Optional(Type.String({ minLength: 1, maxLength: 1_024, pattern: "^[^\\s\\x00]+$" })),
+	allowUpstream: Type.Optional(Type.Boolean()),
+}, CLOSED);
 const FixCiActions = Type.Union([
 	Type.Object({ runId: RouteRunId, action: Type.Literal("collect") }, CLOSED),
 	Type.Object({ runId: RouteRunId, action: Type.Literal("publish") }, CLOSED),
@@ -174,6 +186,7 @@ type WorkflowContextBase = {
 	staleRediscoveries: number;
 	run: PrRun;
 	entryHead: string | null;
+	publication?: PublicationRequest;
 };
 type WorkflowContext =
 	| (WorkflowContextBase & { route: "update-branch"; workflow: UpdateBranchWorkflow; authority: CurrentPullRequest; replan?: string })
@@ -194,16 +207,11 @@ type PullRequestExtensionDependencies = {
 	createCiFixer?: (options: PullRequestCiFixOptions) => FixCiWorkflow;
 	createWorkPublisher?: (options: ConstructorParameters<typeof PullRequestWorkPublisher>[0]) => PullRequestWorkPublisher;
 	syncLocalHead?: PrCommandDependencies["syncLocalHead"];
-	ciPollMs?: PrCommandDependencies["ciPollMs"];
-	loadPrPolicy?: typeof loadPrPolicy;
+	loadPrPolicy?: () => ConfigLoad<PrPolicy>;
 	canonicalWorktree?: (cwd: string, signal?: AbortSignal) => Promise<string>;
 	newRunId?: () => string;
+	now?: () => number;
 };
-
-async function canonicalWorktree(cwd: string, signal?: AbortSignal): Promise<string> {
-	const result = await runChecked(spawnBounded, "git", ["rev-parse", "--show-toplevel"], { cwd, signal });
-	return await realpath(parseSingleOutputLine(result.stdout, "Git worktree root resolution"));
-}
 
 function toolResult(value: unknown) {
 	return {
@@ -237,6 +245,8 @@ export default function pullRequestExtension(
 	pi: ExtensionAPI,
 	dependencies: PullRequestExtensionDependencies = {},
 ): void {
+	const policyStore = createPrPolicyStore();
+	const policyReporter = registerConfigReporting(pi, [policyStore]);
 	const herdr = createHerdrClient(pi.exec.bind(pi));
 	const renameHerdrWorkspace = async (
 		cwd: string,
@@ -277,20 +287,35 @@ export default function pullRequestExtension(
 	const createWorkPublisher = dependencies.createWorkPublisher ?? ((options) => new PullRequestWorkPublisher(options));
 	const resolveCanonicalWorktree = dependencies.canonicalWorktree ?? canonicalWorktree;
 	const newRunId = dependencies.newRunId ?? randomUUID;
+	const now = dependencies.now ?? Date.now;
 	let context: ExtensionContext | undefined;
 	let observation: PullRequestObservation | undefined;
 	const load: typeof loadCurrentPullRequest = async (api, loadContext, inspectedLocal) => {
 		const generation = sessionGeneration;
-		const discovery = await discover(api, loadContext, inspectedLocal, observation);
-		if (generation !== sessionGeneration) return discovery;
-		if (discovery.kind === "current") {
-			const current = pullRequestObservation(discovery.pullRequest);
-			if (current !== null && !samePullRequestObservation(observation, current)) {
-				pi.appendEntry(OBSERVATION_ENTRY, current);
-				observation = current;
+		try {
+			// The latest /pr policy also gates footer refreshes; the session default leaves the Codex gate off.
+			const scoped = prRun.policy.codexReview
+				? { cwd: loadContext.cwd, signal: loadContext.signal, rebaseBranch: loadContext.rebaseBranch, codexReview: true }
+				: loadContext;
+			const discovery = await discover(api, scoped, inspectedLocal, observation);
+			if (generation !== sessionGeneration) return discovery;
+			if (context?.cwd === loadContext.cwd && !loadContext.signal?.aborted) {
+				lastDiscoveryOpen = discovery.kind === "current" && discovery.pullRequest.lifecycle === "open";
+			}
+			if (discovery.kind === "current") {
+				const current = pullRequestObservation(discovery.pullRequest);
+				if (current !== null && !samePullRequestObservation(observation, current)) {
+					pi.appendEntry(OBSERVATION_ENTRY, current);
+					observation = current;
+				}
+			}
+			return discovery;
+		} finally {
+			// Failed checks also delay the next stale refresh.
+			if (generation === sessionGeneration && context?.cwd === loadContext.cwd && !loadContext.signal?.aborted) {
+				lastDiscoveryCompletedAt = now();
 			}
 		}
-		return discovery;
 	};
 	let sessionGeneration = 0;
 	let active: AbortController | undefined;
@@ -298,6 +323,8 @@ export default function pullRequestExtension(
 	let reportedRefreshFailure: "generic" | "quota" | undefined;
 	let displayEstablished = false;
 	let lastDiscovery: "configured" | "inferred" | "absent" | "blocked" | "inactive" | undefined;
+	let lastDiscoveryOpen = false;
+	let lastDiscoveryCompletedAt: number | undefined;
 	let lastBlockedIssueKey: string | undefined;
 	let delegatedWorkPending = false;
 	let pendingWorkspaceRename = false;
@@ -305,6 +332,7 @@ export default function pullRequestExtension(
 	let commandGeneration = 0;
 	let prRun = new PrRun();
 	let workflowContext: WorkflowContext | undefined;
+	let standaloneCommit: { worktree: string; committer: GitCommitter; controller: AbortController } | undefined;
 	const activeInvocations = new Map<number, "routing" | "resolved" | "create-workflow" | "workflow">();
 	let widgetKind: "presentation" | "routing" = "presentation";
 	let routingSpinnerFrame = 0;
@@ -338,11 +366,13 @@ export default function pullRequestExtension(
 			completed: false,
 			staleRediscoveries: invocation.staleRediscoveries ?? 0,
 			run: invocation.run ?? prRun,
+			publication: invocation.publication,
 			entryHead: reservation.route === "create" ? reservation.target.remoteOid : reservation.pullRequest.head.oid,
 		};
+		let selected: Extract<WorkflowContext, { route: "update-branch" | "sweep" }>;
 		switch (reservation.route) {
-			case "update-branch": {
-				const selected: Extract<WorkflowContext, { route: "update-branch" }> = {
+			case "update-branch":
+				selected = {
 					...common,
 					route: "update-branch",
 					authority: cloneCurrentPullRequest(reservation.pullRequest),
@@ -354,22 +384,14 @@ export default function pullRequestExtension(
 						loadCurrentPullRequest: load,
 					}),
 				};
-				workflowContext = selected;
-				try {
-					const action = await selected.workflow.recoveryLaunchAction();
-					invocation.assertCurrent();
-					if (workflowContext !== selected) throw new Error("PR workflow session changed during recovery inspection");
-					return { runId, action };
-				} catch (error) {
-					clearWorkflow(selected);
-					throw error;
-				}
-			}
+				break;
 			case "create":
 				workflowContext = {
 					...common,
 					route: "create",
 					workflow: createPullRequestCreator({
+						preserveExistingMetadata: invocation.publication !== undefined,
+						expectedBase: invocation.publication?.base,
 						cwd: worktree,
 						target: reservation.target,
 						signal: common.controller.signal,
@@ -387,8 +409,8 @@ export default function pullRequestExtension(
 						signal: common.controller.signal, run: common.run, loadCurrentPullRequest: load }),
 				};
 				return { runId, action: "inspect" };
-			case "sweep": {
-				const selected: Extract<WorkflowContext, { route: "sweep" }> = {
+			case "sweep":
+				selected = {
 					...common,
 					route: "sweep",
 					authority: cloneCurrentPullRequest(reservation.pullRequest),
@@ -401,17 +423,7 @@ export default function pullRequestExtension(
 						loadCurrentPullRequest: load,
 					}),
 				};
-				workflowContext = selected;
-				try {
-					const action = await selected.workflow.recoveryLaunchAction();
-					invocation.assertCurrent();
-					if (workflowContext !== selected) throw new Error("PR workflow session changed during recovery inspection");
-					return { runId, action };
-				} catch (error) {
-					clearWorkflow(selected);
-					throw error;
-				}
-			}
+				break;
 			case "fix-ci":
 				workflowContext = {
 					...common,
@@ -426,6 +438,16 @@ export default function pullRequestExtension(
 					}),
 				};
 				return { runId, action: "collect" };
+		}
+		workflowContext = selected;
+		try {
+			const action = await selected.workflow.recoveryLaunchAction();
+			invocation.assertCurrent();
+			if (workflowContext !== selected) throw new Error("PR workflow session changed during recovery inspection");
+			return { runId, action };
+		} catch (error) {
+			clearWorkflow(selected);
+			throw error;
 		}
 	};
 
@@ -481,6 +503,29 @@ export default function pullRequestExtension(
 	};
 
 	pi.registerTool({
+		name: "pi_git_commit",
+		label: "Commit Scoped Work",
+		description: "Inspect a local target and pending work, then commit reviewed paths. Never pushes. Read git-commit guidance first.",
+		parameters: flatRoot(CommitActions),
+		executionMode: "sequential",
+		exposure: "model-only",
+		async execute(_toolCallId, raw, signal, _onUpdate, ctx) {
+			const params = checkedAction(CommitActions, raw);
+			if (workflowContext && workflowContext.route !== "fix-ci") throw new Error("Use the active PR route's commit action");
+			const generation = sessionGeneration;
+			const worktree = await resolveCanonicalWorktree(ctx.cwd, signal);
+			if (generation !== sessionGeneration) throw new Error("Commit session changed");
+			if (standaloneCommit && standaloneCommit.worktree !== worktree) throw new Error("Commit worktree changed; finish the previous inspection first");
+			standaloneCommit ??= { worktree, committer: new GitCommitter({ cwd: worktree }), controller: new AbortController() };
+			const selected = standaloneCommit;
+			const operationSignal = signal ? AbortSignal.any([signal, selected.controller.signal]) : selected.controller.signal;
+			return toolResult(params.action === "inspect"
+				? await selected.committer.inspect(params.target, operationSignal)
+				: await selected.committer.commit(params.inspectionId, params.ownedPaths, params.message, operationSignal));
+		},
+	});
+
+	pi.registerTool({
 		name: "pi_pr_update_branch",
 		label: "Update PR Branch",
 		description: "Run one guarded action for the /pr branch-update route.",
@@ -491,15 +536,17 @@ export default function pullRequestExtension(
 			const params = checkedAction(UpdateBranchActions, raw);
 			return executeWorkflowAction(params.runId, "update-branch", ctx, signal, async (selected) => {
 				switch (params.action) {
-					case "rebase": {
-						const result = await selected.workflow.rebase();
+					case "rebase":
+					case "continue": {
+						const result = params.action === "rebase"
+							? await selected.workflow.rebase()
+							: await selected.workflow.continue(params.resolvedPaths);
 						if (result.kind === "stale") {
 							selected.replan = result.reason;
 							selected.authority = cloneCurrentPullRequest(result.authority);
 						}
 						return result;
 					}
-					case "continue": return await selected.workflow.continue(params.resolvedPaths);
 					case "publish": {
 						const result = await selected.workflow.publish();
 						selected.completed = true;
@@ -724,12 +771,16 @@ export default function pullRequestExtension(
 
 	const stop = (): void => {
 		sessionGeneration += 1;
+		standaloneCommit?.controller.abort();
+		standaloneCommit = undefined;
 		context = undefined;
 		observation = undefined;
 		queued = false;
 		reportedRefreshFailure = undefined;
 		displayEstablished = false;
 		lastDiscovery = undefined;
+		lastDiscoveryOpen = false;
+		lastDiscoveryCompletedAt = undefined;
 		lastBlockedIssueKey = undefined;
 		delegatedWorkPending = false;
 		pendingWorkspaceRename = false;
@@ -856,6 +907,7 @@ export default function pullRequestExtension(
 		}, {
 			sessionGeneration: generation,
 			run: selected.run,
+			publication: selected.publication,
 			staleRediscoveries: selected.staleRediscoveries + (replanning ? 1 : 0),
 			replanAuthority: replanning ? selected.authority : undefined,
 			assertCurrent() {
@@ -925,7 +977,7 @@ export default function pullRequestExtension(
 	});
 
 	pi.on("agent_settled", async (_event, ctx) => {
-		if (!ctx.hasUI || !ctx.isIdle() || !context) return;
+		if (!ctx.isIdle()) return;
 		const selected = workflowContext;
 		const helperSettled = selected?.usedSinceSettlement ?? false;
 		let workflowSettled = false;
@@ -944,9 +996,14 @@ export default function pullRequestExtension(
 				selected.conflictRetained = true;
 			} else clearWorkflow(selected);
 		}
+		if (!ctx.hasUI || !context) return;
 		const delegatedRefresh = delegatedWorkPending && lastDiscovery !== "inactive";
 		delegatedWorkPending = false;
-		if (!workflowSettled && !helperSettled && !delegatedRefresh) return;
+		if (!workflowSettled && !helperSettled && !delegatedRefresh) {
+			if (!active && !queued && lastDiscoveryOpen && lastDiscoveryCompletedAt !== undefined &&
+				now() - lastDiscoveryCompletedAt >= STALE_PR_REFRESH_MS) refreshInBackground();
+			return;
+		}
 		cancelRefresh();
 		if (createWorkflowSettled || helperSettled && selected?.route === "create") pendingWorkspaceRename = true;
 		await refresh().catch(reportRefreshFailure);
@@ -955,6 +1012,10 @@ export default function pullRequestExtension(
 	pi.on("tool_result", async (event, ctx) => {
 		if (!ctx.hasUI || event.isError || lastDiscovery === "inactive") return;
 		if (DELEGATED_TOOLS.has(event.toolName)) delegatedWorkPending = true;
+		if (event.toolName === "pi_git_commit" && event.input.action === "commit") {
+			await refresh().catch(reportRefreshFailure);
+			return;
+		}
 		if (!isBashToolResult(event)) return;
 		const command = event.input.command;
 		if (typeof command === "string" && (GH_PR_CREATE.test(command) || GIT_COMMIT.test(command) || GIT_PUSH.test(command))) {
@@ -963,10 +1024,16 @@ export default function pullRequestExtension(
 	});
 
 	const commandHandler = createCommandHandler(pi, {
-		loadCurrentPullRequest: load,
+		loadCurrentPullRequest: async (api, loadContext, inspectedLocal) => {
+			const generation = sessionGeneration;
+			const discovery = await load(api, loadContext, inspectedLocal);
+			// Show fresh route discovery before settlement, without refreshing helper preflights.
+			if (generation === sessionGeneration && context?.cwd === loadContext.cwd &&
+				!loadContext.signal?.aborted && discovery.kind === "current") render(context, discovery);
+			return discovery;
+		},
 		needsFeedbackAttention: dependencies.needsFeedbackAttention,
 		syncLocalHead: dependencies.syncLocalHead,
-		ciPollMs: dependencies.ciPollMs,
 		inspectBranchRecovery: dependencies.inspectBranchRecovery ?? (async (pullRequest, ctx) => {
 			const worktree = await resolveCanonicalWorktree(ctx.cwd, ctx.signal);
 			return await inspectVerifiedRebaseRecovery(pullRequest, { cwd: worktree, signal: ctx.signal });
@@ -980,12 +1047,13 @@ export default function pullRequestExtension(
 		markWorkflowPromptQueued,
 		releaseWorkflow,
 	});
-	pi.registerCommand("pr", {
-		description: "Run the current branch pull request lifecycle",
-		handler: async (args, ctx) => {
-			if (!ctx.hasUI || !context) return;
+	const launch = async (args: string, ctx: ExtensionContext, publication?: PublicationRequest) => {
+			ctx.signal?.throwIfAborted();
+			if (publication && (workflowContext || activeInvocations.size)) throw new Error("A PR invocation is still active");
 			cancelRefresh();
-			prRun = new PrRun((dependencies.loadPrPolicy ?? loadPrPolicy)());
+			const policy = (dependencies.loadPrPolicy ?? (() => policyStore.loadSync()))();
+			policyReporter.report(ctx, policyStore, policy);
+			prRun = new PrRun(policy.status === "ok" ? policy.value : DEFAULT_PR_POLICY);
 			const generation = sessionGeneration;
 			const invocation = ++commandGeneration;
 			activeInvocations.set(invocation, "routing");
@@ -995,10 +1063,14 @@ export default function pullRequestExtension(
 				activeInvocations.set(invocation, "resolved");
 				reconcileWidget(ctx);
 			};
+			let observed: Awaited<ReturnType<typeof loadCurrentPullRequest>> | undefined;
 			const commandInvocation: PrCommandInvocation = Object.assign(routeResolved, {
 				sessionGeneration: generation,
 				run: prRun,
+				publication,
+				onDiscovery(discovery: Awaited<ReturnType<typeof loadCurrentPullRequest>>) { observed = discovery; },
 				assertCurrent() {
+					ctx.signal?.throwIfAborted();
 					if (sessionGeneration !== generation) {
 						throw new Error("PR command session changed during dispatch");
 					}
@@ -1033,6 +1105,27 @@ export default function pullRequestExtension(
 				activeInvocations.delete(invocation);
 				refreshInBackground();
 			}
+			return { nextStep,
+				...(observed?.kind === "current" ? { url: observed.pullRequest.url.href } : {}),
+				...(observed?.kind === "blocked" ? { blocker: discoveryIssueDetails(observed.issue).message } : {}),
+				...(WORKFLOW_ROUTES.has(nextStep) ? { handoff: "End this turn. The reserved package skill will enter this session at settlement; do not call another PR entry or guess a run ID." } : {}),
+			};
+	};
+	pi.registerCommand("pr", {
+		description: "Run the current branch pull request lifecycle",
+		handler: async (args, ctx) => { if (ctx.hasUI && context) await launch(args, ctx); },
+	});
+	pi.registerTool({
+		name: "pi_git_pr",
+		label: "Create or Update PR",
+		description: "Start guarded PR creation or local publication in this session. Requires user create/update authorization. Never repairs feedback/CI, updates the base, or merges. base must match the existing PR or configured/default creation base. Set allowUpstream only with explicit permission to configure the repository-local branch upstream. Read git-pr guidance first.",
+		parameters: PublicationParameters,
+		executionMode: "sequential",
+		exposure: "model-only",
+		async execute(_id, raw, signal, _update, ctx) {
+			if (!Check(PublicationParameters, raw)) throw new Error("Invalid PR publication request");
+			return toolResult(await launch("", { ...ctx, signal: signal && ctx.signal ? AbortSignal.any([signal, ctx.signal]) : signal ?? ctx.signal },
+				{ base: raw.base, allowUpstream: raw.allowUpstream === true }));
 		},
 	});
 }

@@ -58,6 +58,9 @@ type PullRequestSpec = {
 	mergeStateStatus?: "BEHIND" | "BLOCKED" | "CLEAN" | "DIRTY" | "DRAFT" | "HAS_HOOKS" | "UNKNOWN" | "UNSTABLE";
 	reviewDecision?: "APPROVED" | "CHANGES_REQUESTED" | "REVIEW_REQUIRED" | null;
 	statusCheckRollup?: unknown[];
+	codexReactions?: string[];
+	codexSummary?: true | "older";
+	codexP1Threads?: number;
 };
 
 type CommandSpec = {
@@ -87,6 +90,9 @@ type HarnessOptions = {
 	reservationAction?: "start" | "resume";
 	feedbackChecks?: boolean[];
 	inspectSweepRecovery?: PrCommandDependencies["inspectSweepRecovery"];
+	hasUI?: boolean;
+	confirm?: boolean;
+	codexReview?: boolean;
 };
 
 const result = (stdout = "", code = 0, stderr = "") => ({ stdout, stderr, code, killed: false });
@@ -188,6 +194,8 @@ function harness(options: HarnessOptions) {
 				return result(`${options.pushReference ?? "fork/feature/pr"}\n`);
 			}
 			if (command === "git" && args.join(" ") === "remote") return result(`${(options.remoteNames ?? ["fork", "origin"]).join("\n")}\n`);
+			if (command === "git" && args.join(" ") === "remote -v") return result(`fork\tgit@${nextHost()}:acme/project.git (push)\n`);
+			if (command === "gh" && args.slice(0, 2).join(" ") === "auth token") return result("token\n");
 			if (command === "git" && args[0] === "check-ref-format") {
 				if (args[1] === "--branch") return result(`${args[2]}\n`);
 				if (args[1]?.startsWith("refs/heads/")) return result();
@@ -217,9 +225,13 @@ function harness(options: HarnessOptions) {
 				}
 				if (query.includes("reviewThreads")) {
 					const unresolved = options.unresolvedThreads?.[stateIndex - 1] ?? 0;
+					const codexFinding = { isResolved: false, comments: { nodes: [{ author: { login: "chatgpt-codex-connector" }, body: "![P1 Badge](https://img.shields.io/badge/P1-orange?style=flat) Fix it" }] } };
 					return result(JSON.stringify([{
 						data: { node: { reviewThreads: {
-							nodes: Array.from({ length: unresolved }, () => ({ isResolved: false })),
+							nodes: [
+								...Array.from({ length: unresolved }, () => ({ isResolved: false })),
+								...Array.from({ length: active?.codexP1Threads ?? 0 }, () => codexFinding),
+							],
 							pageInfo: { hasNextPage: false, endCursor: null },
 						} } },
 					}]));
@@ -237,6 +249,14 @@ function harness(options: HarnessOptions) {
 					events.push("merge");
 					return result(JSON.stringify({ data: { mergePullRequest: { pullRequest: { id: pullRequest(active ?? {}).id, state: "MERGED" } } } }));
 				}
+			}
+			if (command === "gh" && args.join(" ") === "api --hostname github.com --paginate --slurp repos/acme/project/issues/42/reactions?per_page=100") {
+				return result(JSON.stringify([(active?.codexReactions ?? []).map((content) => ({ content, user: { login: "chatgpt-codex-connector[bot]" } }))]));
+			}
+			if (command === "gh" && args.join(" ") === "api --hostname github.com --paginate --slurp repos/acme/project/issues/42/comments?per_page=100") {
+				const sha = active?.codexSummary === "older" ? "36e8693" : (active?.headRefOid ?? localHead).slice(0, 7);
+				const summary = `<!-- codex-pull-request-review-summary -->\n| 📝 **Code Review** | ✅ **Completed** | \`${sha}\` | PR opened |`;
+				return result(JSON.stringify([active?.codexSummary ? [{ user: { login: "chatgpt-codex-connector[bot]" }, body: summary }] : []]));
 			}
 			if (command === "git" && args.join(" ") === "status --porcelain=v1 --untracked-files=all") {
 				return result(options.statuses?.[statusIndex++] ?? options.status ?? "");
@@ -276,11 +296,12 @@ function harness(options: HarnessOptions) {
 		cwd,
 		signal: new AbortController().signal,
 		isIdle: () => options.idle ?? true,
+		hasUI: options.hasUI ?? true,
 		ui: {
 			async confirm(title: string, message: string) {
 				events.push("confirm");
 				confirmations.push({ title, message });
-				return true;
+				return options.confirm ?? true;
 			},
 			notify(message: string, type?: string) {
 				events.push("notify");
@@ -306,7 +327,10 @@ function harness(options: HarnessOptions) {
 					events.push("load");
 					return noPullRequest();
 				}
-				return await discoverCurrentPullRequest(...args);
+				const [api, loadContext, ...rest] = args;
+				return await discoverCurrentPullRequest(api, options.codexReview
+					? { cwd: loadContext.cwd, signal: loadContext.signal, codexReview: true }
+					: loadContext, ...rest);
 			},
 			markWorkflowPromptQueued(identity, queued) { if (queued) queuedPrompts.push(identity); },
 			async reserveWorkflow(reservation) {
@@ -391,7 +415,7 @@ test("signals route resolution before dispatch, notification, or mutation", asyn
 	await merge.handler("", merge.context, Object.assign(() => merge.events.push("route"), {
 		sessionGeneration: 1, assertCurrent() {},
 	}));
-	assert.deepEqual(merge.events, ["load", "route", "load", "merge"]);
+	assert.deepEqual(merge.events, ["load", "route", "confirm", "load", "merge"]);
 });
 
 test("routes one package workflow without opening a browser or chaining", async () => {
@@ -430,7 +454,7 @@ test("dispatches creation for dirty-only zero-ahead work", async () => {
 	assert.equal(app.reservations.length, 1);
 });
 
-test("links one inferred target and continues to a guarded merge without confirmation", async () => {
+test("links one inferred target and continues to a confirmed guarded merge", async () => {
 	const state: PullRequestSpec = {};
 	const app = harness({ states: [state, state], pushReference: "", remoteNames: ["fork"] });
 	let linked: CurrentPullRequest | undefined;
@@ -447,7 +471,7 @@ test("links one inferred target and continues to a guarded merge without confirm
 
 	assert.equal(await handler("", app.context), "merge");
 	assert(linked);
-	assert.deepEqual(app.confirmations, []);
+	assert.equal(app.confirmations.length, 1);
 	assert.equal(mutationCalls(app.calls).length, 1);
 	assert.equal(app.messages.length, 0);
 });
@@ -481,6 +505,19 @@ test("returns silently outside a Git worktree", async () => {
 	assert.equal(await handler("", app.context), "none");
 	assert.deepEqual(app.notifications, []);
 	assert.deepEqual(app.messages, []);
+});
+
+test("explains an inactive repository whose remotes are not on GitHub", async () => {
+	const app = harness({ states: [] });
+	const handler = createPrCommandHandler(app.pi, {
+		loadCurrentPullRequest: async () => ({ kind: "inactive", nonGitHubHosts: ["gitea.example"] }),
+	});
+
+	assert.equal(await handler("", app.context), "none");
+	assert.deepEqual(app.notifications, [{
+		message: "/pr needs a GitHub remote: gh has no credentials for gitea.example; for GitHub Enterprise, run gh auth login --hostname <host>",
+		type: "warning",
+	}]);
 });
 
 test("does not route an observed GitHub lookup failure to PR creation", async () => {
@@ -530,6 +567,7 @@ test("dirty work on a diverged local HEAD is committed by publish-work before sy
 test("merges with the configured merge method", async () => {
 	const app = harness({ states: [{}, {}] });
 	assert.equal(await app.handler("", app.context, Object.assign(() => {}, { sessionGeneration: 1, run: new PrRun({ mergeMethod: "rebase" }), assertCurrent() {} })), "merge");
+	assert.match(app.confirmations[0]?.message ?? "", /with rebase\.$/);
 	assert.ok(mutationCalls(app.calls)[0]?.args.includes("mergeMethod=REBASE"));
 });
 
@@ -539,7 +577,7 @@ test("waits for running CI within the invocation budget, then re-reads GitHub be
 
 	const merged = harness({ states: [running, running, {}, {}] });
 	assert.equal(await merged.handler("", merged.context, invocation(new PrRun({ ciPollSeconds: 30, ciWaitMinutes: 10 }))), "merge");
-	assert.deepEqual(merged.events, ["load", "notify", "load", "load", "load", "merge"]);
+	assert.deepEqual(merged.events, ["load", "notify", "load", "load", "confirm", "load", "merge"]);
 	assert.match(merged.notifications[0]?.message ?? "", /CI is running; checking every 30 s for up to 10 min/);
 
 	const commented = harness({ states: [running, { reviewDecision: "CHANGES_REQUESTED" }], commands: [packageCommand("skill:pi-pr-comment-sweep")] });
@@ -561,6 +599,37 @@ test("waits for running CI within the invocation budget, then re-reads GitHub be
 	assert.deepEqual(disabled.notifications, [{ message: "PR #42 is waiting for CI", type: "warning" }]);
 });
 
+test("the opt-in Codex review gate waits within the CI budget and keeps P0/P1 findings from the merge prompt", async () => {
+	const invocation = (run: PrRun) => Object.assign(() => {}, { sessionGeneration: 1, run, assertCurrent() {} });
+	const codexRequests = (calls: Call[]) => calls.filter(({ args }) => args.some((arg) => arg.startsWith("repos/acme/project/issues/42/")));
+
+	const off = harness({ states: [{ codexReactions: ["eyes"] }, {}] });
+	assert.equal(await off.handler("", off.context, invocation(new PrRun())), "merge");
+	assert.equal(codexRequests(off.calls).length, 0);
+
+	const reviewed = harness({ codexReview: true, states: [{ codexReactions: ["eyes"] }, { codexSummary: true }, { codexSummary: true }] });
+	assert.equal(await reviewed.handler("", reviewed.context, invocation(new PrRun({ ciPollSeconds: 30, ciWaitMinutes: 10 }))), "merge");
+	assert.deepEqual(reviewed.events, ["load", "notify", "load", "confirm", "load", "merge"]);
+	assert.match(reviewed.notifications[0]?.message ?? "", /waiting for the Codex review; checking every 30 s for up to 10 min/);
+
+	const stale = harness({ codexReview: true, states: [{ codexReactions: ["+1"], codexSummary: "older" }, { codexReactions: ["+1"], codexSummary: "older" }, { codexReactions: ["+1"], codexSummary: "older" }] });
+	assert.equal(await stale.handler("", stale.context, invocation(new PrRun({ ciPollSeconds: 30, ciWaitMinutes: 1 }))), "none");
+	assert.equal(stale.confirmations.length + mutationCalls(stale.calls).length, 0);
+
+	const silent = harness({ codexReview: true, states: [{}, {}, {}] });
+	assert.equal(await silent.handler("", silent.context, invocation(new PrRun({ ciPollSeconds: 30, ciWaitMinutes: 1 }))), "none");
+	assert.deepEqual(silent.events, ["load", "notify", "load", "load", "notify"]);
+	assert.equal(silent.notifications.at(-1)?.message, 'PR #42 is still waiting for the Codex review of the current head; run /pr again later');
+	assert.equal(silent.confirmations.length + mutationCalls(silent.calls).length, 0);
+
+	const run = new PrRun();
+	run.complete("sweep", localHead);
+	const findings = harness({ codexReview: true, states: [{ codexSummary: true, codexP1Threads: 1 }] });
+	assert.equal(await findings.handler("", findings.context, invocation(run)), "none");
+	assert.deepEqual(findings.notifications, [{ message: "PR sweep already ran; 1 unresolved Codex P0/P1 findings block the merge prompt", type: "warning" }]);
+	assert.equal(findings.confirmations.length, 0);
+});
+
 test("a synced head is never synced twice in one invocation", async () => {
 	const run = new PrRun();
 	run.complete("sync-local", localHead);
@@ -574,7 +643,7 @@ test("re-reads pending GitHub mergeability a bounded number of times", async () 
 	const pending: PullRequestSpec = { mergeable: "UNKNOWN", mergeStateStatus: "UNKNOWN" };
 	const resolved = harness({ states: [pending, {}, {}] });
 	assert.equal(await resolved.handler("", resolved.context), "merge");
-	assert.deepEqual(resolved.events, ["load", "load", "load", "merge"]);
+	assert.deepEqual(resolved.events, ["load", "load", "confirm", "load", "merge"]);
 
 	for (const confirmed of [
 		{ mergeable: "CONFLICTING", mergeStateStatus: "UNKNOWN" },
@@ -754,8 +823,8 @@ test("cancels a confirmed merge when post-inspection authority is absent, differ
 		const app = harness({ states: candidate.states, statuses: candidate.statuses, unresolvedThreads: candidate.unresolvedThreads });
 		await assert.rejects(app.handler("", app.context), candidate.error, candidate.name);
 
-		assert.equal(app.confirmations.length, 0, candidate.name);
-		assert.deepEqual(app.events, ["load", "load"], candidate.name);
+		assert.equal(app.confirmations.length, 1, candidate.name);
+		assert.deepEqual(app.events, ["load", "confirm", "load"], candidate.name);
 		assert.equal(mutationCalls(app.calls).length, 0, candidate.name);
 	}
 });
@@ -767,7 +836,7 @@ test("cancels a confirmed merge when local HEAD changes during readiness", async
 	});
 
 	await assert.rejects(app.handler("", app.context), /Final local merge safety check failed: HEAD changed/);
-	assert.deepEqual(app.events, ["load", "load"]);
+	assert.deepEqual(app.events, ["load", "confirm", "load"]);
 	assert.equal(app.calls.filter(({ command, args }) => command === "git" && args[0] === "fetch").length, 2);
 	assert.equal(mutationCalls(app.calls).length, 0);
 });
@@ -788,7 +857,7 @@ test("cancels a confirmed merge when the confirmed head or base context changes"
 		});
 		await assert.rejects(app.handler("", app.context), /confirmed pull request context changed/, candidate.name);
 
-		assert.deepEqual(app.events, ["load", "load"], candidate.name);
+		assert.deepEqual(app.events, ["load", "confirm", "load"], candidate.name);
 		assert.equal(app.calls.filter(({ command, args }) => command === "git" && args[0] === "fetch").length, 2, candidate.name);
 		assert.equal(mutationCalls(app.calls).length, 0, candidate.name);
 	}
@@ -803,7 +872,7 @@ test("cancels when the base retargets or advances during final readiness evaluat
 		const app = harness({ states: [{}, candidate.finalState], baseRefTargets: candidate.baseRefTargets });
 		await assert.rejects(app.handler("", app.context), /confirmed pull request context changed/, candidate.name);
 
-		assert.deepEqual(app.events, ["load", "load"], candidate.name);
+		assert.deepEqual(app.events, ["load", "confirm", "load"], candidate.name);
 		assert.equal(mutationCalls(app.calls).length, 0, candidate.name);
 		const finalFetch = app.calls.map(({ command, args }) => command === "git" && args[0] === "fetch").lastIndexOf(true);
 		const readiness = app.calls.map(({ command, args }) =>
@@ -830,8 +899,11 @@ test("merges unchanged fresh context with the atomic expected head", async () =>
 	});
 	assert.equal(await app.handler("", app.context), "merge");
 
-	assert.deepEqual(app.confirmations, []);
-	assert.deepEqual(app.events, ["load", "load", "merge"]);
+	assert.deepEqual(app.confirmations, [{
+		title: "Merge PR #42?",
+		message: `https://${host}/acme/project/pull/42\nHead ${localHead.slice(0, 12)} into main with squash.`,
+	}]);
+	assert.deepEqual(app.events, ["load", "confirm", "load", "merge"]);
 	const fetches = app.calls.filter(({ command, args }) => command === "git" && args[0] === "fetch");
 	assert.equal(fetches.length, 2);
 	assert.ok(fetches.every(({ args }) => args[4] === `git@${host}:acme/project.git`));
@@ -866,6 +938,22 @@ test("merges unchanged fresh context with the atomic expected head", async () =>
 		],
 	}]);
 	assert.equal(app.calls.some(({ args }) => args.includes("--web")), false);
+});
+
+test("a declined merge confirmation makes no merge mutation", async () => {
+	const app = harness({ states: [{}], confirm: false });
+	assert.equal(await app.handler("", app.context), "none");
+	assert.deepEqual(app.events, ["load", "confirm", "notify"]);
+	assert.deepEqual(app.notifications, [{ message: "PR #42 is merge-ready; merge declined", type: "info" }]);
+	assert.equal(mutationCalls(app.calls).length, 0);
+});
+
+test("a session without UI stops at merge-ready without a merge mutation", async () => {
+	const app = harness({ states: [{}], hasUI: false });
+	assert.equal(await app.handler("", app.context), "none");
+	assert.deepEqual(app.events, ["load", "notify"]);
+	assert.match(app.notifications[0]?.message ?? "", /PR #42 is merge-ready; merge needs confirmation/);
+	assert.equal(mutationCalls(app.calls).length, 0);
 });
 
 test("flagless /pr routes freshly detected standalone feedback before merge", async () => {

@@ -3,7 +3,7 @@ import { tmpdir } from "node:os";
 import { basename, join } from "node:path";
 import { runGit, type GitResult } from "./git-process.ts";
 import { CheckedGitRuntime } from "./git-runtime.ts";
-import { createChildWorktree, inspectWorktreeDirty, WorktreeSetupError, type WorktreeInfo } from "./worktree.ts";
+import { createChildWorktree, inspectWorktreeDirty, OWNED_BRANCH_PATTERN, WORKTREES_DIRNAME, WorktreeSetupError, type WorktreeInfo } from "./worktree.ts";
 import {
 	checkBatchPasses, reviewEvidencePasses, sameIdentity, type CheckBatchEvidence,
 	type CheckCommand, type ReviewEvidence, type WorkspaceIdentity,
@@ -61,8 +61,8 @@ async function ownershipMetadata(root: string, info: WorktreeInfo, signal: Abort
 	const repoRoot = await realpath(primary.slice("worktree ".length));
 	if (await realpath(await requireGit(["rev-parse", "--show-toplevel"], root, signal)) !== canonical
 		|| info.repoRoot !== repoRoot || info.cwd !== info.path
-		|| !/^pi-subagent\/subagent-[0-9a-f]{24}$/.test(info.branch)
-		|| info.path !== join(repoRoot, ".worktrees", basename(info.branch))) {
+		|| !OWNED_BRANCH_PATTERN.test(info.branch)
+		|| info.path !== join(repoRoot, WORKTREES_DIRNAME, basename(info.branch))) {
 		throw new Error("Git worktree is not an exact owned checkout of Main.");
 	}
 }
@@ -339,15 +339,22 @@ export class IntegrationGit {
 		return { outcome: "unknown", failure: "Promotion returned success but exact clean Main tip could not be proved.", possibleResources: [integration.path, integration.branch] };
 	}
 
+	/** Read-only proof that an owned checkout, its registration, and its branch are all gone. */
+	async absent(root: string, info: WorktreeInfo, signal: AbortSignal): Promise<boolean> {
+		await ownershipMetadata(root, info, signal);
+		const registered = await requireGit(["worktree", "list", "--porcelain", "-z"], root, signal);
+		if (registered.split("\0").includes(`worktree ${info.path}`) || await exists(info.path)) return false;
+		const args = ["show-ref", "--verify", "--quiet", `refs/heads/${info.branch}`];
+		const ref = await git(args, root, signal);
+		if (ref.code !== 0 && ref.code !== 1) throw new Error(failure(args, ref));
+		return ref.code === 1;
+	}
+
 	/** Explicit release of an unselected clean checkout. The branch deletion is an exact ref compare-and-swap. */
 	async release(root: string, info: WorktreeInfo, expected: WorkspaceIdentity, kind: "worktree" | "branch", signal: AbortSignal): Promise<GitOutcome<"removed" | "absent">> {
 		const possibleResources = [info.path, info.branch];
 		try {
 			await ownershipMetadata(root, info, signal);
-			if (expected.branch !== `refs/heads/${info.branch}` || expected.index !== expected.tree
-				|| !await ancestor(info.baseCommit, expected.head, root, signal)) {
-				return { outcome: "blocked", failure: "Release lacks an exact clean owned branch and base lineage." };
-			}
 			const registered = await requireGit(["worktree", "list", "--porcelain", "-z"], root, signal);
 			const present = registered.split("\0").includes(`worktree ${info.path}`);
 			const pathPresent = await exists(info.path);
@@ -357,8 +364,13 @@ export class IntegrationGit {
 			}
 			const branch = await git(["rev-parse", "--verify", ref], root, signal);
 			if (branch.code !== 0 && branch.code !== 128) throw new Error("Owned branch tip could not be inspected.");
+			// Absence needs no lineage proof: nothing remains to remove, even after Git pruned the commits.
+			if (!present && !pathPresent && (kind === "worktree" || branch.code === 128)) return { outcome: "ready", value: "absent" };
+			if (expected.branch !== ref || expected.index !== expected.tree
+				|| !await ancestor(info.baseCommit, expected.head, root, signal)) {
+				return { outcome: "blocked", failure: "Release lacks an exact clean owned branch and base lineage." };
+			}
 			if (kind === "worktree") {
-				if (!present && !pathPresent) return { outcome: "ready", value: "absent" };
 				if (!present || !pathPresent || branch.stdout.trim() !== expected.head
 					|| !sameIdentity(await current(root, info, signal), expected)) {
 					return { outcome: "blocked", failure: "Owned checkout, registration, branch or clean candidate changed." };
@@ -373,7 +385,6 @@ export class IntegrationGit {
 				return { outcome: "ready", value: "removed" };
 			}
 			if (present || pathPresent) return { outcome: "blocked", failure: "Release the exact checkout before branch deletion." };
-			if (branch.code === 128) return { outcome: "ready", value: "absent" };
 			if (branch.stdout.trim() !== expected.head) return { outcome: "blocked", failure: "Owned branch differs from the approved tip." };
 			const args = ["update-ref", "-d", ref, expected.head];
 			const deleted = await git(args, root, signal);

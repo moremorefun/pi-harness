@@ -78,6 +78,7 @@ function harness(options: {
 
 	const ctx = {
 		model: options.currentModel ?? defaultModel,
+		scopedModels: [],
 		modelRegistry: {
 			getAvailable: () => models,
 			streamSimple: (model: Model, context: any, completionOptions: any) => ({
@@ -205,6 +206,9 @@ test("automatic rename uses expanded first prompt instead of raw input shorthand
 		});
 		await app.handlers.get("session_start")?.({}, app.ctx);
 		app.handlers.get("input")?.({ source: "interactive", text: "/fix-login" }, app.ctx);
+		await new Promise((resolve) => setTimeout(resolve, 0));
+		assert.equal(app.completionCalls.length, 0);
+		await app.handlers.get("before_agent_start")?.({ messageType: "custom", message: {} }, app.ctx);
 		await new Promise((resolve) => setTimeout(resolve, 0));
 		assert.equal(app.completionCalls.length, 0);
 
@@ -712,7 +716,7 @@ test("a legacy colon reply still parses when the route answers in the old shape"
 	});
 });
 
-test("rename warns once when the shared task-model config is missing", async () => {
+test("rename reports a missing shared task-model config", async () => {
 	await withAgentDir(async (dir) => {
 		await rm(join(dir, "config", "pi-task-models", "config.json"));
 		const app = harness({
@@ -720,7 +724,10 @@ test("rename warns once when the shared task-model config is missing", async () 
 			branch: [{ type: "message", message: { role: "user", content: "prompt" } }],
 		});
 		await app.handlers.get("session_start")?.({}, app.ctx);
-		assert.deepEqual(app.notifications, ["Task model config is missing; run /task-models to configure rename routing."]);
+		await app.commands.get("rename")?.("", app.ctx);
+		assert.equal(app.completionCalls.length, 0);
+		assert.deepEqual(app.names, []);
+		assert.deepEqual(app.notifications, ["Task model config is missing. Run /task-models to configure task routes."]);
 		assert.deepEqual(app.notificationTypes, ["warning"]);
 	});
 });
@@ -733,7 +740,6 @@ test("rename reports an unconfigured fast profile without changing the title", a
 			branch: [{ type: "message", message: { role: "user", content: "prompt" } }],
 		});
 		await app.handlers.get("session_start")?.({}, app.ctx);
-		assert.match(app.notifications.at(-1) ?? "", /Configure rename task profile fast/);
 		await app.commands.get("rename")?.("", app.ctx);
 		assert.equal(app.completionCalls.length, 0);
 		assert.deepEqual(app.names, []);
@@ -752,11 +758,10 @@ test("rename reports malformed shared config without rewriting it", async () => 
 			branch: [{ type: "message", message: { role: "user", content: "prompt" } }],
 		});
 		await app.handlers.get("session_start")?.({}, app.ctx);
-		assert.match(app.notifications[0] ?? "", /Couldn't read task model config/);
 		await app.commands.get("rename")?.("", app.ctx);
 		assert.equal(app.completionCalls.length, 0);
 		assert.deepEqual(app.names, []);
-		assert.match(app.notifications.at(-1) ?? "", /Couldn't read task model config/);
+		assert.match(app.notifications.at(-1) ?? "", /pi-task-models\/config.json is disabled: invalid JSON/);
 		assert.equal(await readFile(taskModelsFile, "utf8"), malformed);
 	});
 });

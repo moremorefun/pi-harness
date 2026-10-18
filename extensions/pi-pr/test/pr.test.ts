@@ -5,6 +5,7 @@ import { execFileSync } from "node:child_process";
 import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import type { ConfigIssue } from "@henryqw/pi-config-store";
 import { spawnBounded, type Exec as BoundedExec } from "@henryqw/pi-process";
 import { PullRequestCommentSweep, StaleSweepStart } from "../extensions/pr-comment-sweep.ts";
 import { PullRequestBranchUpdater } from "../extensions/pr-update-branch.ts";
@@ -188,6 +189,7 @@ function harness(options: {
 	sessionEntries?: unknown[];
 	canonicalWorktree?: ExtensionDependencies["canonicalWorktree"];
 	newRunId?: ExtensionDependencies["newRunId"];
+	now?: ExtensionDependencies["now"];
 	createBranchUpdater?: ExtensionDependencies["createBranchUpdater"];
 	createPullRequestCreator?: ExtensionDependencies["createPullRequestCreator"];
 	createCommentSweep?: ExtensionDependencies["createCommentSweep"];
@@ -197,6 +199,7 @@ function harness(options: {
 	createWorkPublisher?: ExtensionDependencies["createWorkPublisher"];
 	syncLocalHead?: ExtensionDependencies["syncLocalHead"];
 	policy?: Partial<PrPolicy>;
+	policyIssues?: ConfigIssue[];
 	isIdle?: () => boolean;
 	skillPath?: string;
 }) {
@@ -231,6 +234,7 @@ function harness(options: {
 		},
 		canonicalWorktree: options.canonicalWorktree,
 		newRunId: options.newRunId,
+		now: options.now,
 		createBranchUpdater: options.createBranchUpdater,
 		createPullRequestCreator: options.createPullRequestCreator,
 		createCommentSweep: options.createCommentSweep,
@@ -239,7 +243,7 @@ function harness(options: {
 		createCiFixer: options.createCiFixer,
 		createWorkPublisher: options.createWorkPublisher,
 		syncLocalHead: options.syncLocalHead,
-		loadPrPolicy: () => ({ ...DEFAULT_PR_POLICY, ciWaitMinutes: 0, ...options.policy }),
+		loadPrPolicy: () => ({ status: "ok", source: "missing", value: { ...DEFAULT_PR_POLICY, ciWaitMinutes: 0, ...options.policy }, issues: options.policyIssues ?? [] }),
 		needsFeedbackAttention: async () => false,
 	};
 	if (!options.useDefaultCommandHandler) {
@@ -359,6 +363,7 @@ function harness(options: {
 test("registers sequential model-only tools with flat object roots and strict actions", async () => {
 	const app = harness({ async load() { return { kind: "inactive" }; } });
 	const expected = new Map([
+		["pi_git_commit", ["inspect", "commit"]],
 		["pi_pr_update_branch", ["rebase", "continue", "publish"]],
 		["pi_pr_create", ["prepare", "inspect", "commit", "verify", "push", "publish"]],
 		["pi_pr_publish_work", ["inspect", "commit", "validate", "publish"]],
@@ -366,7 +371,7 @@ test("registers sequential model-only tools with flat object roots and strict ac
 		["pi_pr_fix_ci", ["collect", "publish"]],
 	]);
 
-	assert.deepEqual(app.tools.map(({ name }) => name), [...expected.keys()]);
+	assert.deepEqual(app.tools.map(({ name }) => name), [...expected.keys(), "pi_git_pr"]);
 	for (const tool of app.tools) {
 		assert.equal(tool.executionMode, "sequential", tool.name);
 		// Codemode scripts must not batch guarded actions or filter their results; `only` mode keeps model-only tools declared.
@@ -382,13 +387,15 @@ test("registers sequential model-only tools with flat object roots and strict ac
 		assert.equal(schema.type, "object", tool.name);
 		assert.equal(schema.anyOf, undefined, tool.name);
 		assert.equal(schema.additionalProperties, false, tool.name);
-		assert.deepEqual(schema.required, ["runId", "action"], tool.name);
+		if (tool.name === "pi_git_pr") continue;
+		assert.deepEqual(schema.required, tool.name === "pi_git_commit" ? ["action"] : ["runId", "action"], tool.name);
 		assert.deepEqual(schema.properties.action.anyOf.map(({ const: value }) => value), expected.get(tool.name), tool.name);
 	}
 	// Flat parameters cannot express action-dependent requirements; reject invalid combinations at execution.
 	const ctx = app.context();
 	const guard = { epoch: 1, runId: "run", generation: 1, fingerprint: "a".repeat(64) };
 	for (const [name, args] of [
+		["pi_git_commit", { action: "commit", ownedPaths: [] }],
 		["pi_pr_sweep", { runId: routeRunId, action: "refresh", guard, checks: [] }],
 		["pi_pr_create", { runId: routeRunId, action: "commit", ownedPaths: [] }],
 		["pi_pr_update_branch", { runId: routeRunId, action: "rebase", extra: true }],
@@ -653,6 +660,33 @@ for (const routes of [
 	} finally { await app.shutdown(ctx); }
 });
 
+test("a conflict continuation that aborts its rebase reroutes in the same /pr", async () => {
+	let loads = 0;
+	const ids = [1, 2].map((n) => `${String(n).repeat(8)}-1111-4111-8111-111111111111`);
+	let runs = 0;
+	const app = harness({
+		async load() { loads++; return currentPullRequest({ conditions: { conflict: true } }); },
+		useDefaultCommandHandler: true, isIdle: () => false, newRunId: () => ids[runs++]!,
+		async canonicalWorktree() { return "/repo"; },
+		createBranchUpdater: (options) => ({ state: { phase: "ready" }, async recoveryLaunchAction() { return "rebase"; },
+			async rebase() { return { kind: "conflict", paths: ["file.txt"] }; },
+			async continue() { return { kind: "stale", reason: "rebase aborted and original restored", authority: options.authority }; } }) as never,
+	});
+	const ctx = app.context();
+	try {
+		await app.start(ctx);
+		await app.command().handler("", ctx as ExtensionCommandContext);
+		await app.beforeSettle(ctx);
+		await app.callTool("pi_pr_update_branch", { runId: ids[0], action: "rebase" }, ctx);
+		assert.equal(((await app.callTool("pi_pr_update_branch", { runId: ids[0], action: "continue", resolvedPaths: ["file.txt"] }, ctx)).details as { kind: string }).kind, "stale");
+		const before = loads;
+		const next = await app.beforeSettle(ctx);
+		assert.equal(next?.continue, true);
+		assert.equal(loads, before + 1);
+		assert.equal(runs, 2);
+	} finally { await app.shutdown(ctx); }
+});
+
 test("dirty diverged work is committed, synced onto the PR head, and published in one /pr", async () => {
 	const ids = [1, 2].map((n) => `${String(n).repeat(8)}-1111-4111-8111-111111111111`);
 	const locals: Array<CurrentPullRequest["local"]> = [
@@ -752,6 +786,39 @@ test("one /pr continues from a final answer through hidden boundaries until exte
 	} finally { await app.shutdown(ctx); }
 });
 
+for (const answer of [false, true]) test(`a finalized sweep continuation asks before merge and ${answer ? "reaches merge safety after yes" : "stops after no"}`, async () => {
+	let finalized = false;
+	const runId = "11111111-1111-4111-8111-111111111111";
+	const confirmations: string[] = [];
+	const merges: unknown[] = [];
+	const app = harness({
+		async load() { return currentPullRequest({ conditions: { unresolvedThreads: finalized ? 0 : 1 } }); },
+		useDefaultCommandHandler: true, newRunId: () => runId,
+		async canonicalWorktree() { return "/repo"; },
+		createCommentSweep() { return {
+			async recoveryLaunchAction() { return "start" as const; },
+			async finalize() { finalized = true; return { kind: "finalized" }; },
+		} as never; },
+		async exec(command, args) {
+			if (command === "gh" && args.some((arg) => arg.includes("mergePullRequest"))) merges.push(args);
+			throw new Error(`merge safety stops here: ${command} ${args.join(" ")}`);
+		},
+	});
+	const base = app.context();
+	const ctx = { ...base, ui: { ...base.ui, async confirm(title: string) { confirmations.push(title); return answer; } } } as ExtensionContext;
+	try {
+		await app.start(ctx);
+		await app.command().handler("", ctx as ExtensionCommandContext);
+		assert.deepEqual(app.messages, [`/skill:pi-pr-comment-sweep runId=${runId} action=start`]);
+		assert.deepEqual(confirmations, [], "routine sweep dispatch does not ask");
+		await app.callTool("pi_pr_sweep", { runId, action: "finalize", guard: { epoch: 1, runId: "run", generation: 1, fingerprint: "a".repeat(64) }, checks: [] }, ctx);
+		assert.equal(await app.beforeSettle(ctx), undefined);
+		assert.deepEqual(confirmations, ["Merge PR #42?"]);
+		assert.deepEqual(merges, []);
+		assert.match(app.notifications.at(-1)!.message, answer ? /continuation stopped: merge safety stops here: git/ : /PR #42 is merge-ready; merge declined/);
+	} finally { await app.shutdown(ctx); }
+});
+
 for (const quotaExhausted of [false, true]) test(quotaExhausted
 	? "creation continuation does not retry an exhausted GitHub quota at settlement"
 	: "creation continuation refreshes the footer when it stops for CI", async () => {
@@ -780,7 +847,11 @@ for (const quotaExhausted of [false, true]) test(quotaExhausted
 		idle = false;
 		await app.callTool("pi_pr_create", { runId: routeRunId, action: "publish", title: "fix", body: "Summary" }, ctx);
 		await app.beforeSettle(ctx);
-		assert.equal(app.statuses.at(-1), undefined, "presentation waits until the agent settles");
+		if (quotaExhausted) assert.equal(app.statuses.at(-1), undefined);
+		else {
+			assert.match(plain(String(app.statuses.at(-1))), /PR #42.*CI running/);
+			assert.equal(app.widgets.at(-1), undefined, "the action hint waits until the agent settles");
+		}
 		const loadsBeforeSettlement = loads;
 		idle = true;
 		await app.settle(ctx);
@@ -790,6 +861,41 @@ for (const quotaExhausted of [false, true]) test(quotaExhausted
 		} else {
 			assert.match(plain(String(app.statuses.at(-1))), /PR #42.*CI running/);
 		}
+	} finally { await app.shutdown(ctx); }
+});
+
+test("the codexReview policy reaches PR discovery after /pr loads it", async () => {
+	const gates: Array<boolean | undefined> = [];
+	const app = harness({
+		async load(_pi, context) { gates.push(context.codexReview); return currentPullRequest({ conditions: { draft: true } }); },
+		useDefaultCommandHandler: true, policy: { codexReview: true },
+	});
+	const ctx = app.context();
+	try {
+		await app.start(ctx);
+		await app.command().handler("", ctx as ExtensionCommandContext);
+		assert.deepEqual(gates.slice(0, 2), [undefined, true]);
+	} finally { await app.shutdown(ctx); }
+});
+
+test("an invalid policy key warns once per session and /pr continues with its default", async () => {
+	const gates: Array<boolean | undefined> = [];
+	const app = harness({
+		async load(_pi, context) { gates.push(context.codexReview); return currentPullRequest({ conditions: { draft: true } }); },
+		useDefaultCommandHandler: true, policyIssues: [{ kind: "invalid-value", key: "codexReview", message: "must be true or false" }],
+	});
+	const ctx = app.context();
+	try {
+		await app.start(ctx);
+		for (let run = 0; run < 2; run++) {
+			const discoveries = gates.length;
+			await app.command().handler("", ctx as ExtensionCommandContext);
+			assert.ok(gates.length > discoveries, "/pr still discovers the PR");
+		}
+		assert.ok(gates.every((gate) => gate === undefined), "codexReview uses its default, false");
+		const warnings = app.notifications.filter(({ message }) => message.includes("codexReview: must be true or false"));
+		assert.deepEqual(warnings.map(({ type }) => type), ["warning"]);
+		assert.match(warnings[0]!.message, /^pi-pr config issues .*defaults replace invalid settings\.$/);
 	} finally { await app.shutdown(ctx); }
 });
 
@@ -942,6 +1048,7 @@ test("rejects session replacement while workflow discovery is pending", async ()
 		staleDiscovery.resolve(authority);
 
 		await assert.rejects(staleCommand, /session changed during dispatch/);
+		assert.equal(app.statuses.at(-1), undefined, "stale command discovery must not replace the new session footer");
 		assert.equal(canonicalCalls, 0);
 		assert.deepEqual(app.messages, []);
 		await assert.rejects(
@@ -951,6 +1058,27 @@ test("rejects session replacement while workflow discovery is pending", async ()
 	} finally {
 		await app.shutdown(replacement);
 	}
+});
+
+for (const cancelled of [false, true]) test(`does not render command discovery from ${cancelled ? "an aborted lookup" : "another cwd"}`, async () => {
+	const pending = deferred<CurrentPullRequest>();
+	let loads = 0;
+	const app = harness({
+		async load() { return ++loads === 2 ? pending.promise : { kind: "inactive" }; },
+		useDefaultCommandHandler: true,
+		async canonicalWorktree() { throw new Error("stop after discovery"); },
+	});
+	const ctx = app.context();
+	const controller = new AbortController();
+	const commandContext = { ...ctx, cwd: cancelled ? ctx.cwd : "/other", signal: controller.signal };
+	try {
+		await app.start(ctx);
+		const command = app.command().handler("", commandContext as ExtensionCommandContext);
+		if (cancelled) controller.abort();
+		pending.resolve(currentPullRequest({ conditions: { conflict: true } }));
+		await assert.rejects(command, cancelled ? /aborted/ : /stop after discovery/);
+		assert.ok(app.statuses.every((status) => status === undefined), "unrelated discovery must never enter the footer");
+	} finally { await app.shutdown(ctx); }
 });
 
 test("rejects session replacement while canonical workflow authority is pending", async () => {
@@ -1777,11 +1905,12 @@ test("warns once for one blocked issue and warns again after recovery", async ()
 	await app.shutdown(ctx);
 });
 
-test("renders the shared projection and refreshes after successful create or push", async () => {
+test("renders the shared projection and refreshes after successful create, push, or guarded commit", async () => {
 	const results: Array<CurrentPullRequest | CurrentPullRequestDiscovery> = [
 		currentPullRequest({ conditions: { ci: "failure" } }),
 		currentPullRequest({ conditions: { ci: "running" } }),
 		noPullRequest(1),
+		noPullRequest(2),
 	];
 	const signals: Array<AbortSignal | undefined> = [];
 	const app = harness({
@@ -1817,6 +1946,12 @@ test("renders the shared projection and refreshes after successful create or pus
 	assert.equal(signals.length, 3);
 	assert.equal(app.statuses.at(-1), undefined);
 	assert.deepEqual(app.widgets.at(-1), widgetLine("● Run /pr to create pull request"));
+
+	await app.tool({ toolName: "pi_git_commit", input: { action: "inspect" }, isError: false }, ctx);
+	await app.tool({ toolName: "pi_git_commit", input: { action: "commit" }, isError: true }, ctx);
+	assert.equal(signals.length, 3);
+	await app.tool({ toolName: "pi_git_commit", input: { action: "commit" }, isError: false }, ctx);
+	assert.equal(signals.length, 4);
 
 	await app.shutdown(ctx);
 });
@@ -2160,6 +2295,123 @@ test("reports generic then sanitized rate-limit failures, clears its stale actio
 	await app.shutdown(ctx);
 });
 
+test("refreshes a stale open PR in the background only on idle settlement", async () => {
+	const pending = deferred<CurrentPullRequest>();
+	let now = 0;
+	let idle = true;
+	let loads = 0;
+	let signal: AbortSignal | undefined;
+	const app = harness({
+		now: () => now,
+		isIdle: () => idle,
+		async load(_pi, ctx) {
+			if (++loads === 1) return currentPullRequest({ conditions: { ci: "running" } });
+			signal = ctx.signal;
+			return pending.promise;
+		},
+	});
+	const ctx = app.context();
+	try {
+		await app.start(ctx);
+		now = 119_999;
+		await app.settle(ctx);
+		assert.equal(loads, 1);
+		now = 120_000;
+		idle = false;
+		await app.settle(ctx);
+		assert.equal(loads, 1);
+		idle = true;
+		await app.settle(ctx);
+		assert.equal(loads, 2, "settlement must not wait for background discovery");
+		await app.settle(ctx);
+		assert.equal(signal?.aborted, false, "settlement must not cancel active discovery");
+		pending.resolve(currentPullRequest({ lifecycle: "merged" }));
+		await flush();
+		assert.equal(loads, 2, "settlement must not queue another discovery");
+		assert.match(plain(app.statuses.at(-1) ?? ""), /PR #42.*merged/);
+	} finally { await app.shutdown(ctx); }
+});
+
+for (const state of ["inactive", "absent", "blocked", "merged", "closed"] as const) {
+	test(`does not stale-refresh ${state} discovery`, async () => {
+		let now = 0;
+		let loads = 0;
+		const app = harness({
+			now: () => now,
+			async load() {
+				loads += 1;
+				if (state === "inactive") return { kind: "inactive" };
+				if (state === "absent") return noPullRequest();
+				if (state === "blocked") return { kind: "blocked", issue: { kind: "published-without-pr", remote: "origin" } };
+				return currentPullRequest({ lifecycle: state });
+			},
+		});
+		const ctx = app.context();
+		try {
+			await app.start(ctx);
+			now = 120_000;
+			await app.settle(ctx);
+			assert.equal(loads, 1);
+		} finally { await app.shutdown(ctx); }
+	});
+}
+
+for (const quota of [false, true]) test(`delays stale refresh after ${quota ? "quota" : "generic"} failure completion`, async () => {
+	const pending = deferred<CurrentPullRequest>();
+	let now = 0;
+	let loads = 0;
+	const app = harness({
+		now: () => now,
+		async load() {
+			if (++loads === 2) return pending.promise;
+			return currentPullRequest();
+		},
+	});
+	const ctx = app.context();
+	try {
+		await app.start(ctx);
+		now = 120_000;
+		await app.settle(ctx);
+		now = 150_000;
+		pending.reject(quota ? new GitHubRateLimitError() : new Error("temporary failure"));
+		await flush();
+		await app.settle(ctx);
+		now = 269_999;
+		await app.settle(ctx);
+		assert.equal(loads, 2, "failed discovery must reset age at completion");
+		assert.equal(app.notifications.length, 1);
+		now = 270_000;
+		await app.settle(ctx);
+		await flush();
+		assert.equal(loads, 3);
+	} finally { await app.shutdown(ctx); }
+});
+
+test("command route discovery resets stale age before workflow dispatch completes", async () => {
+	const worktree = deferred<string>();
+	let now = 0;
+	let loads = 0;
+	const app = harness({
+		now: () => now,
+		async load() { loads += 1; return currentPullRequest({ conditions: { ci: "failure" } }); },
+		useDefaultCommandHandler: true,
+		canonicalWorktree: () => worktree.promise,
+		createCiFixer: () => ({}) as never,
+	});
+	const ctx = app.context();
+	try {
+		await app.start(ctx);
+		now = 120_000;
+		const command = app.command().handler("", ctx as ExtensionCommandContext);
+		await flush();
+		now = 239_999;
+		await app.settle(ctx);
+		assert.equal(loads, 2, "fresh route discovery must delay stale refresh");
+		worktree.resolve("/repo");
+		await command;
+	} finally { await app.shutdown(ctx); }
+});
+
 test("serializes native-event refreshes, retains loader errors, and stops cleanly", async () => {
 	const pending = deferred<CurrentPullRequest | null>();
 	const duringShutdown = deferred<CurrentPullRequest | null>();
@@ -2345,7 +2597,7 @@ test("keeps the create hint cleared until the workflow settles", async () => {
 		assert.equal(loads, 2);
 		assert.equal(plain(app.statuses.at(-1) ?? ""), "PR #42 · merge-ready");
 		assert.match(app.statuses.at(-1) ?? "", /\x1b\]8;;https:\/\/github\.com\/acme\/project\/pull\/42\x1b\\/);
-		assert.deepEqual(app.widgets.at(-1), widgetLine("✓ Run /pr to merge pull request"));
+		assert.deepEqual(app.widgets.at(-1), widgetLine("✓ Run /pr to confirm and merge pull request"));
 
 	} finally {
 		setCapabilities(previousCapabilities);
@@ -2400,7 +2652,7 @@ test("normalizes the Herdr workspace label after a create workflow settles", asy
 				},
 			]);
 			assert.equal(plain(app.statuses.at(-1) ?? ""), "PR #42 · merge-ready");
-			assert.deepEqual(app.widgets.at(-1), widgetLine("✓ Run /pr to merge pull request"));
+			assert.deepEqual(app.widgets.at(-1), widgetLine("✓ Run /pr to confirm and merge pull request"));
 		} finally {
 			await app.shutdown(ctx);
 		}
@@ -2528,7 +2780,7 @@ test("warns without hiding the refreshed PR when Herdr labeling fails", async ()
 				type: "warning",
 			}]);
 			assert.equal(plain(app.statuses.at(-1) ?? ""), "PR #42 · merge-ready");
-			assert.deepEqual(app.widgets.at(-1), widgetLine("✓ Run /pr to merge pull request"));
+			assert.deepEqual(app.widgets.at(-1), widgetLine("✓ Run /pr to confirm and merge pull request"));
 
 			await app.tool({
 				toolName: "bash",
@@ -2587,7 +2839,9 @@ test("session replacement aborts Herdr labeling before stale rename or warning",
 test("keeps a non-create hint hidden until its workflow settles", async () => {
 	const workflow = deferred<"fix-ci">();
 	let loads = 0;
+	let now = 0;
 	const app = harness({
+		now: () => now,
 		async load() {
 			loads += 1;
 			return loads < 3
@@ -2621,9 +2875,11 @@ test("keeps a non-create hint hidden until its workflow settles", async () => {
 		}, ctx);
 		assert.equal(app.widgets.at(-1), undefined, "a workflow refresh must not restore the hint");
 
+		now = 120_000;
 		await app.settle(ctx);
-		assert.equal(loads, 3);
-		assert.deepEqual(app.widgets.at(-1), widgetLine("✓ Run /pr to merge pull request"));
+		await flush();
+		assert.equal(loads, 3, "workflow settlement must not add a stale refresh");
+		assert.deepEqual(app.widgets.at(-1), widgetLine("✓ Run /pr to confirm and merge pull request"));
 	} finally {
 		await app.shutdown(ctx);
 	}
@@ -2870,7 +3126,7 @@ test("requires a newly ahead commit before offering creation after a merge", asy
 
 	try {
 		await app.start(ctx);
-		assert.deepEqual(app.widgets.at(-1), widgetLine("✓ Run /pr to merge pull request"));
+		assert.deepEqual(app.widgets.at(-1), widgetLine("✓ Run /pr to confirm and merge pull request"));
 
 		await app.command().handler("", ctx as ExtensionCommandContext);
 		await flush();
@@ -2887,4 +3143,137 @@ test("requires a newly ahead commit before offering creation after a merge", asy
 	} finally {
 		await app.shutdown(ctx);
 	}
+});
+
+test("agent PR entry checks base and upstream consent before reservation", async () => {
+	for (const scenario of ["base", "link", "create"] as const) {
+		let reserved = false;
+		const app = harness({
+			load: async () => scenario === "create" ? noPullRequest(1) : currentPullRequest({ provenance: scenario === "link" ? "inferred" : "configured" }),
+			useDefaultCommandHandler: true,
+			canonicalWorktree: async () => { reserved = true; return "/repo"; },
+		});
+		const ctx = app.context();
+		try {
+			await app.start(ctx);
+			await assert.rejects(app.callTool("pi_git_pr", scenario === "base" ? { base: "release" } : {}, ctx),
+				scenario === "base" ? /differs from current PR base main/ : /allowUpstream/);
+			assert.equal(reserved, false);
+			assert.equal(app.execCalls.length, 0, "no config or remote mutation");
+			await assert.rejects(app.callTool("pi_git_pr", { allowUpstream: "yes" }, ctx), /Invalid PR publication/);
+		} finally { await app.shutdown(ctx); }
+	}
+});
+
+for (const scenario of ["merge", "fix-ci", "update-branch", "sweep-recovery"] as const) test(`agent PR entry stops before ${scenario}`, async () => {
+	const pr = currentPullRequest({ conditions: { ci: scenario === "fix-ci" ? "failure" : "success", conflict: scenario === "update-branch" } });
+	if (scenario === "sweep-recovery") pr.local.worktree = "dirty";
+	const app = harness({ load: async () => pr, useDefaultCommandHandler: true,
+		inspectSweepRecovery: async () => scenario === "sweep-recovery",
+		canonicalWorktree: async () => { throw new Error("must not reserve unauthorized work"); },
+	});
+	const ctx = app.context();
+	try {
+		await app.start(ctx);
+		const result = await app.callTool("pi_git_pr", { base: "main" }, ctx);
+		assert.deepEqual(result.details, { nextStep: "none", url: pr.url.href });
+		assert.match(app.notifications[0]!.message, /authorization stops before/);
+		assert.equal(app.execCalls.length, 0);
+	} finally { await app.shutdown(ctx); }
+});
+
+test("agent PR entry carries base constraint, rejects overlap, and expires an aborted non-UI handoff", async () => {
+	let expectedBase: string | undefined;
+	let preserveExistingMetadata: boolean | undefined;
+	let busy = true;
+	const app = harness({ load: async () => noPullRequest(1), useDefaultCommandHandler: true,
+		isIdle: () => !busy, canonicalWorktree: async () => "/repo", newRunId: () => routeRunId,
+		createPullRequestCreator(options) {
+			expectedBase = options.expectedBase;
+			preserveExistingMetadata = options.preserveExistingMetadata;
+			return {} as never;
+		},
+	});
+	const ctx = { ...app.context(), hasUI: false };
+	try {
+		await app.start(ctx);
+		await app.callTool("pi_git_pr", { base: "release", allowUpstream: true }, ctx);
+		assert.equal(expectedBase, "release");
+		assert.equal(preserveExistingMetadata, true);
+		await assert.rejects(app.callTool("pi_git_pr", {}, ctx), /still active/);
+		assert.equal(await app.beforeSettle(ctx, "aborted"), undefined);
+		busy = false;
+		await app.settle(ctx);
+		await assert.rejects(app.callTool("pi_pr_create", { runId: routeRunId, action: "prepare" }, ctx), /No PR workflow/);
+	} finally { await app.shutdown(ctx); }
+});
+
+test("native source Git tools commit and publish in a controlled temporary repository", async (t) => {
+	const dir = mkdtempSync(join(tmpdir(), "pi-pr-source-tools-"));
+	const previousAgentDir = process.env.PI_CODING_AGENT_DIR;
+	process.env.PI_CODING_AGENT_DIR = join(dir, "agent");
+	t.after(() => {
+		if (previousAgentDir === undefined) delete process.env.PI_CODING_AGENT_DIR;
+		else process.env.PI_CODING_AGENT_DIR = previousAgentDir;
+		rmSync(dir, { recursive: true, force: true });
+	});
+	const root = join(dir, "worktree");
+	const bare = join(dir, "remote.git");
+	execFileSync("git", ["init", "--bare", bare], { stdio: "ignore" });
+	execFileSync("git", ["init", "--initial-branch=main", root], { stdio: "ignore" });
+	const git = (...args: string[]) => execFileSync("git", args, { cwd: root, encoding: "utf8", stdio: ["ignore", "pipe", "pipe"] }).trim();
+	git("config", "user.name", "Source Tool Test"); git("config", "user.email", "test@example.invalid");
+	writeFileSync(join(root, "file.txt"), "base\n");
+	git("add", "file.txt"); git("commit", "-qm", "initial"); git("switch", "-c", "feature/pr");
+	const initial = git("rev-parse", "HEAD");
+	git("push", bare, `${initial}:refs/heads/feature/pr`);
+	git("remote", "add", "origin", "git@github.com:acme/project.git");
+	let pushes = 0;
+	const exec: BoundedExec = async (command, args, options) => {
+		if (command === "gh" && args[0] === "repo") return execResult(JSON.stringify({ nameWithOwner: "acme/project", url: "https://github.com/acme/project" }));
+		assert.equal(command, "git", "unexpected GitHub mutation or command");
+		if (["push", "ls-remote"].includes(args[0]!) && args.includes("git@github.com:acme/project.git")) {
+			if (args[0] === "push") {
+				pushes++;
+				assert.ok(args.includes(`--force-with-lease=refs/heads/feature/pr:${initial}`));
+				assert.ok(args.includes(`${git("rev-parse", "HEAD")}:refs/heads/feature/pr`));
+			}
+			args = args.map((value) => value === "git@github.com:acme/project.git" ? bare : value);
+		}
+		return await spawnBounded(command, args, options);
+	};
+	const app = harness({ useDefaultCommandHandler: true, isIdle: () => false, newRunId: () => routeRunId,
+		load: async () => {
+			const pr = currentPullRequest({ conditions: { ci: "success" } });
+			const remoteHead = git("ls-remote", bare, "refs/heads/feature/pr").split("\t")[0]!;
+			pr.base.oid = initial; pr.head.oid = remoteHead; pr.target.remoteOid = remoteHead;
+			pr.local = { worktree: git("status", "--porcelain") ? "dirty" : "clean", head: git("rev-parse", "HEAD") === remoteHead ? "equal" : "ahead" };
+			return pr;
+		},
+		createWorkPublisher: (options) => new PullRequestWorkPublisher({ ...options, exec, agentDir: join(dir, "agent") }),
+	});
+	const ctx = { ...app.context(), cwd: root, hasUI: false };
+	try {
+		await app.start(ctx);
+		writeFileSync(join(root, "file.txt"), "local commit\n");
+		const inspected = (await app.callTool("pi_git_commit", { action: "inspect", target: "main" }, ctx)).details as { inspectionId: string };
+		await app.callTool("pi_git_commit", { action: "commit", inspectionId: inspected.inspectionId, ownedPaths: ["file.txt"], message: "fix: local work" }, ctx);
+		assert.equal(pushes, 0, "standalone commit never publishes");
+		await assert.rejects(app.callTool("pi_git_pr", { base: "release" }, ctx), /differs from current PR base/);
+		writeFileSync(join(root, "file.txt"), "published work\n");
+		const launched = await app.callTool("pi_git_pr", { base: "main" }, ctx);
+		assert.match(String((launched.details as { handoff: string }).handoff), /End this turn/);
+		const handoff = (await app.beforeSettle(ctx))?.entries?.[0];
+		assert.ok(handoff && "content" in handoff);
+		assert.match(String(handoff.content), /pi-pr-publish-work/);
+		await assert.rejects(app.callTool("pi_git_commit", { action: "inspect", target: "main" }, ctx), /active PR route/);
+		await app.callTool("pi_pr_publish_work", { runId: routeRunId, action: "inspect" }, ctx);
+		await app.callTool("pi_pr_publish_work", { runId: routeRunId, action: "commit", ownedPaths: ["file.txt"], message: "fix: publish work" }, ctx);
+		await app.callTool("pi_pr_publish_work", { runId: routeRunId, action: "validate", checks: [] }, ctx);
+		await app.callTool("pi_pr_publish_work", { runId: routeRunId, action: "publish" }, ctx);
+		assert.equal(pushes, 1);
+		assert.equal(git("ls-remote", bare, "refs/heads/feature/pr").split("\t")[0], git("rev-parse", "HEAD"));
+		assert.equal(await app.beforeSettle(ctx), undefined, "merge-ready PR is not merged by create/update authorization");
+		assert.ok(app.notifications.some(({ message }) => /authorization stops before merge/.test(message)));
+	} finally { await app.shutdown(ctx); }
 });

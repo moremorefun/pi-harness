@@ -93,8 +93,10 @@ function harness(executor: (prepared: Prepared) => Promise<{ outcome: "success" 
 		},
 	};
 	cronExtension(pi, { agentDir, executor: (limits) => { policies.push(limits); return fakeExecutor; }, now: () => now, tickMs: 3_600_000 });
+	// Pi passes one event object to every handler of an event.
 	const emit = async (event: string) => {
-		for (const handler of handlers.get(event) ?? []) await handler({}, ctx);
+		const payload = {};
+		for (const handler of handlers.get(event) ?? []) await handler(payload, ctx);
 	};
 	return {
 		notices, messages, prepared, policies, emit, ctx, pi,
@@ -152,11 +154,11 @@ test("a new job waits for its slot, then runs once in a persisted session with t
 test("/cron run forces a run, refuses a concurrent claim, and follow-up delivery goes through sendMessage", async () => {
 	let release!: () => void;
 	const gate = new Promise<void>((resolve) => { release = resolve; });
-	await writeJobs([{ id: "digest", every: "1d", role: "scout", cwd: agentDir, prompt: "Go.", notify: "followUp" }]);
+	// Disabled, so the session-start tick never holds the local admission while it claims this job.
+	await writeJobs([{ id: "digest", every: "1d", role: "scout", cwd: agentDir, prompt: "Go.", enabled: false, notify: "followUp" }]);
 	await rm(join(agentDir, "config", "pi-cron", "state.json"), { force: true });
 	const h = harness(async () => { await gate; return { outcome: "failure", output: "boom" }; });
 	await h.emit("session_start");
-	await h.settle();
 	await h.command("run digest");
 	await h.settle(() => h.prepared.length === 1);
 	assert.ok(h.notices.some((notice) => notice.startsWith("Started digest")), h.notices.join("\n"));
@@ -237,7 +239,7 @@ test("pre-launch failures record no session and the menu explains its absence", 
 	await h.settle(() => h.notices.some((notice) => notice.includes("no session created")));
 	const record = JSON.parse(await readFile(join(agentDir, "config", "pi-cron", "state.json"), "utf8")).jobs["missing-role"];
 	assert.equal(record.lastSession, undefined);
-	assert.ok(h.notices.some((notice) => notice.includes("no session created") && notice.includes("not configured")));
+	assert.ok(h.notices.some((notice) => notice.includes("no session created") && notice.includes("Unknown Subagent role: not-configured")));
 	h.select("missing-role · disabled", "Show last run");
 	await h.command("");
 	assert.ok(h.notices.some((notice) => notice.includes("Session: none created")));
@@ -249,13 +251,16 @@ test("later scheduled admissions reload edited jobs and limits, skipping disable
 	const gate = new Promise<void>((resolve) => { release = resolve; });
 	const jobs = ["first", "edited", "disabled", "removed"].map((id) => ({ id, every: "1m", role: "scout", cwd: agentDir, prompt: id }));
 	await writeJobs(jobs);
-	await rm(join(agentDir, "config", "pi-cron", "state.json"), { force: true });
+	const home = join(agentDir, "config", "pi-cron");
+	// Set the baseline before admission; session_start does not await its tick.
+	await writeFile(join(home, "state.json"), JSON.stringify({
+		version: 1,
+		jobs: Object.fromEntries(jobs.map(({ id }) => [id, { firstSeenAt: SLOT - 3_600_000 }])),
+	}));
 	const h = harness(async (run) => {
 		if (run.task === "first") await gate;
 		return { outcome: "success", output: "done" };
 	});
-	await h.emit("session_start");
-	await h.settle();
 	h.setNow(SLOT);
 	await h.emit("session_start");
 	await h.settle(() => h.prepared.length === 1);
@@ -305,12 +310,54 @@ test("a result recorded after shutdown is not sent into a tearing-down session",
 	assert.equal(h.messages.length, 0);
 });
 
-test("an invalid config pauses jobs with one visible error", async () => {
-	await writeFile(join(agentDir, "config", "pi-cron", "config.json"), JSON.stringify({ jobs: [{ id: "x" }] }));
+test("a bad job is reported once across ticks and commands while valid jobs still run", async () => {
+	const path = join(agentDir, "config", "pi-cron", "config.json");
+	await writeFile(path, JSON.stringify({ jobs: [{ id: "x" }, ...["good", "other"].map((id) => ({ id, every: "1d", role: "scout", cwd: agentDir, prompt: "Go.", enabled: false }))] }));
+	await rm(join(agentDir, "config", "pi-cron", "state.json"), { force: true });
 	const h = harness(async () => ({ outcome: "success", output: "" }));
 	await h.emit("session_start");
-	await h.emit("session_start");
-	assert.equal(h.notices.filter((notice) => notice.includes("is invalid; jobs are paused")).length, 1, h.notices.join("\n"));
-	assert.equal(h.prepared.length, 0);
+	await h.settle();
+	await h.command("");
+	await h.command("run good");
+	await h.settle(() => h.notices.some((notice) => notice.includes("Scheduled job good finished")));
+	const issues = h.notices.filter((notice) => notice.startsWith("pi-cron config issues"));
+	assert.deepEqual(issues, [`pi-cron config issues (${path}): jobs[0]: Job x needs exactly one of every or at; defaults replace invalid settings.`], h.notices.join("\n"));
 	await h.emit("session_shutdown");
+});
+
+test("a job start reports roleDefaults and task-model config issues added during the session", async () => {
+	await writeJobs([{ id: "edited", every: "1d", role: "scout", cwd: agentDir, prompt: "Go.", enabled: false }]);
+	await rm(join(agentDir, "config", "pi-cron", "state.json"), { force: true });
+	const h = harness(async () => ({ outcome: "success", output: "" }));
+	await h.emit("session_start");
+	const subagentPath = join(agentDir, "config", "pi-subagent", "config.json");
+	const taskModelsPath = join(agentDir, "config", "pi-task-models", "config.json");
+	const taskModels = await readFile(taskModelsPath, "utf8");
+	await mkdir(join(subagentPath, ".."), { recursive: true });
+	await writeFile(subagentPath, JSON.stringify({ roleDefaults: { mcps: [] } }));
+	await writeFile(taskModelsPath, JSON.stringify({ ...JSON.parse(taskModels), extra: 1 }));
+	try {
+		await h.command("run edited");
+		await h.settle(() => h.notices.some((notice) => notice.includes("Scheduled job edited finished")));
+		assert.ok(h.notices.includes(`pi-subagent config issues (${subagentPath}): roleDefaults.mcps: unknown key; defaults replace invalid settings.`), h.notices.join("\n"));
+		assert.ok(h.notices.includes(`pi-task-models config issues (${taskModelsPath}): extra: unknown key; defaults replace invalid settings.`), h.notices.join("\n"));
+	} finally {
+		await rm(subagentPath, { force: true });
+		await writeFile(taskModelsPath, taskModels);
+		await h.emit("session_shutdown");
+	}
+});
+
+test("an invalid state file shows one error across jobs and ticks", async () => {
+	await writeJobs(["first", "second"].map((id) => ({ id, every: "1d", role: "scout", cwd: agentDir, prompt: "Go." })));
+	const statePath = join(agentDir, "config", "pi-cron", "state.json");
+	await writeFile(statePath, "{");
+	const h = harness(async () => ({ outcome: "success", output: "" }));
+	await h.emit("session_start");
+	await h.settle();
+	await h.emit("session_start");
+	await h.settle();
+	assert.equal(h.notices.filter((notice) => notice.includes("could not schedule")).length, 1, h.notices.join("\n"));
+	await h.emit("session_shutdown");
+	await rm(statePath, { force: true });
 });

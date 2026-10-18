@@ -1,12 +1,24 @@
 import assert from "node:assert/strict";
 import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
+import { mkdirSync, mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { getCapabilities, setCapabilities, stripTerminalSequences } from "@earendil-works/pi-tui";
 import footerExtension from "../extensions/footer.ts";
+import openInExtension from "../extensions/open.ts";
 
+
+// Isolate footer color config so a developer's real agent directory cannot change render output.
+const isolatedAgentDir = mkdtempSync(join(tmpdir(), "pi-footer-agent-"));
+const previousAgentDir = process.env.PI_CODING_AGENT_DIR;
+process.env.PI_CODING_AGENT_DIR = isolatedAgentDir;
+process.on("exit", () => {
+	if (previousAgentDir === undefined) delete process.env.PI_CODING_AGENT_DIR;
+	else process.env.PI_CODING_AGENT_DIR = previousAgentDir;
+	rmSync(isolatedAgentDir, { recursive: true, force: true });
+});
 const usage = (input: number, output: number, cacheRead: number, cost: number) => ({
 	input,
 	output,
@@ -26,11 +38,9 @@ function setupFooter(
 	{
 		appendEntry = () => {},
 		exec = async () => ({ stdout: "", stderr: "", code: 1, killed: false }),
-		notify = () => {},
 	}: {
 		appendEntry?: (customType: string, data: unknown) => void;
 		exec?: (command: string, args: string[]) => Promise<{ stdout: string; stderr: string; code: number; killed: boolean }>;
-		notify?: (message: string, type: string) => void;
 	} = {},
 ) {
 	const handlers = new Map<string, Handler>();
@@ -52,7 +62,6 @@ function setupFooter(
 					setFooter(factory: FooterFactory) {
 						footerFactory = factory;
 					},
-					notify,
 				},
 			}) as unknown as ExtensionContext;
 			const sessionStart = handlers.get("session_start");
@@ -91,10 +100,8 @@ test("renders family status on the first line and external statuses beside runti
 			details: { usage: usage(300, 50, 0, 0.04) },
 		},
 	];
-	const notifications: Array<[string, string]> = [];
 	const { start } = setupFooter({
 		exec: async () => ({ stdout: gitOutput, stderr: "", code: 0, killed: false }),
-		notify: (message, type) => notifications.push([message, type]),
 	});
 
 	const ctx = {
@@ -107,7 +114,6 @@ test("renders family status on the first line and external statuses beside runti
 	};
 
 	const footerFactory = await start(ctx);
-	assert.deepEqual(notifications, []);
 	const colors: [string, string][] = [];
 	let extensionStatuses = new Map([
 		["ponytail", "●  🐴\tponytail: ⚡ FULL\r\nready"],
@@ -157,9 +163,9 @@ test("renders family status on the first line and external statuses beside runti
 	assert.doesNotMatch(footer.render(100)[0]!, /vscode:\/\//);
 	await writeFile(openInConfig, '{"command":"code -n"}');
 	assert.match(footer.render(100)[0]!, /vscode:\/\/file\/Users\/me\/\.herdr\/worktrees\/repo\/worktree-clear-field-f8d2\?windowId=_blank/);
+	// Malformed open-in config falls back to `code`; launch reporting, not render, shows the issue.
 	await writeFile(openInConfig, "{not json");
-	assert.doesNotThrow(() => footer.render(100));
-	assert.doesNotMatch(footer.render(100)[0]!, /vscode:\/\//);
+	assert.match(footer.render(100)[0]!, /vscode:\/\/file\/Users\/me\/\.herdr\/worktrees\/repo\/worktree-clear-field-f8d2\x1b\\/);
 	await writeFile(openInConfig, '{"command":"code"}');
 	setCapabilities({ ...previousCapabilities, hyperlinks: false });
 	assert.doesNotMatch(footer.render(100)[0]!, /\x1b\]8;;/);
@@ -292,6 +298,51 @@ test("preserves CodeGraph badges and muted preparation statuses, and marks direc
 	footer.dispose();
 });
 
+test("footer-only activation reports open-in issues at session start, never per render, and shares the report with /open", async (t) => {
+	const agentDir = await mkdtemp(join(tmpdir(), "pi-footer-open-in-"));
+	process.env.PI_CODING_AGENT_DIR = agentDir;
+	t.after(async () => {
+		process.env.PI_CODING_AGENT_DIR = isolatedAgentDir;
+		await rm(agentDir, { recursive: true, force: true });
+	});
+	const configPath = join(agentDir, "config", "pi-open-in", "config.json");
+	await mkdir(join(configPath, ".."), { recursive: true });
+	await writeFile(configPath, JSON.stringify({ command: "code", extra: 1 }));
+	const start = async (extensions: Array<(pi: ExtensionAPI) => void>) => {
+		const sessionStart: Handler[] = [];
+		const notices: string[] = [];
+		const pi = {
+			on(event: string, handler: Handler) { if (event === "session_start") sessionStart.push(handler); },
+			registerCommand() {},
+			appendEntry() {},
+			exec: async () => ({ stdout: "", stderr: "", code: 1, killed: false }),
+		} as unknown as ExtensionAPI;
+		for (const extension of extensions) extension(pi);
+		let factory: FooterFactory | undefined;
+		const ctx = {
+			mode: "tui", cwd: "/repo", hasUI: true, getContextUsage: () => undefined,
+			sessionManager: { getEntries: () => [], getLeafId: () => null, getBranch: () => [] },
+			ui: { notify: (message: string) => notices.push(message), setFooter: (next: FooterFactory) => { factory = next; } },
+		} as unknown as ExtensionContext;
+		// Pi passes one event object to every session_start handler.
+		const event = { type: "session_start" };
+		for (const handler of sessionStart) await handler(event, ctx);
+		return { notices, footer: () => factory!({ requestRender() {} }, { fg: (_color, text) => text }, {
+			getGitBranch: () => undefined, getExtensionStatuses: () => new Map(), onBranchChange: () => () => {},
+		}) };
+	};
+	const issue = `pi-open-in config issues (${configPath}): extra: unknown key; defaults replace invalid settings.`;
+
+	const footerOnly = await start([footerExtension]);
+	assert.deepEqual(footerOnly.notices, [issue]);
+	const footer = footerOnly.footer();
+	for (let index = 0; index < 3; index++) footer.render(100);
+	assert.deepEqual(footerOnly.notices, [issue]);
+	footer.dispose();
+
+	assert.deepEqual((await start([footerExtension, openInExtension])).notices, [issue]);
+});
+
 test("shows deterministic Git status and refreshes after an agent run", async (t) => {
 	const gitDir = await mkdtemp(join(tmpdir(), "pi-footer-git-"));
 	await mkdir(join(gitDir, "rebase-merge"));
@@ -413,6 +464,24 @@ test("shows TPS and active session time", async () => {
 		await handlers.get("message_end")!({ message: assistantMessage });
 		assert.match(footer.render(100)[1]!, /⚡ — /);
 
+		// A burst (non-streamed fallback or one large chunk) has no measurable rate.
+		const burstMessage = { role: "assistant", usage: { output: 1_000 } };
+		for (const at of [10_000, 10_001, 10_028]) {
+			now = at;
+			await handlers.get("message_update")!({ message: burstMessage });
+		}
+		await handlers.get("message_end")!({ message: burstMessage });
+		assert.match(footer.render(100)[1]!, /⚡ — /);
+
+		// A short, fast stream at the minimum window still shows its rate.
+		const shortMessage = { role: "assistant", usage: { output: 50 } };
+		now = 11_000;
+		await handlers.get("message_update")!({ message: shortMessage });
+		now = 11_250;
+		await handlers.get("message_update")!({ message: shortMessage });
+		await handlers.get("message_end")!({ message: shortMessage });
+		assert.match(footer.render(100)[1]!, /⚡ 200\.0 t\/s/);
+
 		await handlers.get("message_end")!({ message: { role: "assistant", usage: { output: 10 } } });
 		assert.match(footer.render(100)[1]!, /⚡ — /);
 
@@ -525,11 +594,10 @@ test("excludes prompt waits and persists a paused run", async () => {
 
 test("restores cumulative agent time on resume and appends updated totals", async () => {
 	const appended: Array<[string, unknown]> = [];
-	const { handlers, start } = setupFooter({
-		appendEntry(customType, data) {
-			appended.push([customType, data]);
-		},
-	});
+	const appendEntry = (customType: string, data: unknown) => {
+		appended.push([customType, data]);
+	};
+	const { handlers, start } = setupFooter({ appendEntry });
 	const entries = [
 		{ type: "custom", customType: "pi-footer:agent-work", data: 1_000 },
 		{ type: "custom", customType: "pi-footer:agent-work", data: -5 },
@@ -556,15 +624,16 @@ test("restores cumulative agent time on resume and appends updated totals", asyn
 		assert.deepEqual(appended, [["pi-footer:agent-work", 67_500]]);
 		assert.equal(footer.render(100)[2]!.trim(), "◷ 1m 7s");
 
-		// Non-TUI sessions restore their own total before global agent handlers append.
+		// Non-TUI sessions restore their own total before agent handlers append.
 		now = 10_000;
-		await handlers.get("session_start")!({}, {
+		const resumed = setupFooter({ appendEntry }).handlers;
+		await resumed.get("session_start")!({}, {
 			mode: "rpc",
 			sessionManager: { getEntries: () => entries },
 		} as unknown as ExtensionContext);
-		await handlers.get("agent_start")!(undefined, ctx);
+		await resumed.get("agent_start")!(undefined, ctx);
 		now = 11_500;
-		await handlers.get("agent_settled")!(undefined, ctx);
+		await resumed.get("agent_settled")!(undefined, ctx);
 		assert.deepEqual(appended, [
 			["pi-footer:agent-work", 67_500],
 			["pi-footer:agent-work", 66_500],

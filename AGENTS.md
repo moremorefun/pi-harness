@@ -11,6 +11,7 @@ When `.codegraph/codegraph.db` exists, use `codegraph_explore` for symbol lookup
 - Compatibility covers each package's documented public contract, not its internals or undocumented behavior. Breaking internal changes need no major release.
 - Use Pi's effective skill and model registries and model metadata as authority. Resolve resources at launch; store names or classes, not paths or copied catalogs.
 - For extension config homes, follow [ADR 018](docs/adr/018-extension-config-homes.md). Use `extensionConfigDir` and `extensionConfigPath` from `@henryqw/pi-config-store`, validate untrusted JSON, preserve malformed files, and write only after explicit user action.
+- User-edited extension config must load through `@henryqw/pi-config-store` fields (`createConfigStore` with `fields` or `entries`) and report issues with `registerConfigReporting`; do not read config files with direct JSON parsing. Follow [ADR 004](docs/adr/004-extension-config-safety.md) for warn and disable rules.
 
 ## Package releases
 
@@ -22,7 +23,9 @@ For each new public package, check whether it exists on npm before finishing. If
 
 ## Documentation
 
-Write user-facing READMEs in plain English: lead with the user outcome, keep commands, paths, API names, and errors exact, and state requirements, limits, failures, and safety risks. After an extension change, update its README if user-visible behavior or guidance changed. For extension READMEs, follow [the canonical template](extensions/README-template.md); use H3 for package-specific topics. `pnpm run docs:validate` enforces H2 names and order against the template.
+`pnpm run docs:validate` enforces the mechanical ASD-STE100 rules in `website/ste.ts`, but passing it does not prove full conformance.
+
+Write user-facing READMEs in ASD-STE100 Simplified Technical English with the package's `CONTEXT.md` terms: lead with the user outcome, keep commands, paths, API names, and errors exact, and state requirements, limits, failures, and safety risks. After an extension change, update its README if user-visible behavior or guidance changed. For extension READMEs, follow [the canonical template](extensions/README-template.md); use H3 for package-specific topics. `pnpm run docs:validate` enforces H2 names and order against the template.
 
 Follow [the diagram guide](docs/diagram-style.md). Set each README-linked SVG root's `width` and `height` to its `viewBox` dimensions. Include local files linked from a published README in the package allowlist and verify them with `npm pack --dry-run`.
 
@@ -32,10 +35,13 @@ For README/template-only changes, preserve unique guidance and verify structure,
 
 This repository owns [pi-extension-workbench](.agents/skills/pi-extension-workbench/SKILL.md); maintain it here, not in `HenryQW/skills` or `skills-lock.json`. Keep installed Pi docs, examples, and declarations as runtime authority. Validate skill changes with `python3 .agents/skills/pi-extension-workbench/scripts/validate.py`.
 
+After you change a package skill that has a suite in [evals/](evals/README.md), run `node evals/run.ts --skill <name>` and report the results. Evals call a model, so CI does not run them.
+
 ## Task runbooks
 
 - [GitHub issues](docs/agents/issue-tracker.md) and [triage labels](docs/agents/triage-labels.md)
 - [Pi version upgrades](docs/agents/pi-version-upgrade.md)
+- [Herdr version upgrades](docs/agents/herdr-version-upgrade.md)
 - [Domain terms, contexts, and ADRs](docs/agents/domain.md)
 
 ## Knowledge storage

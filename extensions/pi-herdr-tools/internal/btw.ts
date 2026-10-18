@@ -1,14 +1,8 @@
 import { randomUUID } from "node:crypto";
 import type { ExtensionAPI, ExtensionCommandContext, ExtensionContext } from "@earendil-works/pi-coding-agent";
+import { registerConfigReporting } from "@henryqw/pi-config-store";
 import { createHerdrClient, hasHerdrErrorCode, startPiAgent } from "@henryqw/pi-herdr";
-import {
-	loadTaskModelsConfig,
-	registerModelTask,
-	resolveConfiguredTaskRoutes,
-	type ModelTask,
-	type ResolvedTaskRoute,
-	type TaskRouteError,
-} from "@henryqw/pi-task-models";
+import { registerModelTask, registerTaskModelsConfigReporting, type ModelTask, type ResolvedTaskRoute } from "@henryqw/pi-task-models";
 import {
 	buildSessionContext,
 	convertToLlm,
@@ -31,7 +25,6 @@ import {
 	CHILD_PAYLOAD_FLAG,
 	buildNativeBridgeMessage,
 	buildParentContextMessage,
-	classifyLaunchResult,
 	createPayload,
 	LAUNCH_DRAFT_ARG,
 	LAUNCH_DRAFT_COMMAND,
@@ -52,6 +45,7 @@ import {
 	type MergeRequest,
 } from "./merge.ts";
 import { HELP_TEXT, parseBtwCommand } from "./router.ts";
+import { configuredTaskRoutes } from "./task-models.ts";
 
 export const BTW_TASK = {
 	id: "pi-herdr-btw/btw",
@@ -85,7 +79,7 @@ export type ContextStorePort = Pick<
 >;
 export type ConfigStorePort = Pick<
 	ReturnType<typeof createBtwConfigStore>,
-	"loadSync" | "save" | "update"
+	"extensionId" | "path" | "loadSync" | "save" | "update"
 >;
 
 const SIDE_PANE_INSTRUCTIONS = `You are running in a focused /btw side pane spawned from another Pi session.
@@ -94,51 +88,25 @@ The user will ask a question related to, but potentially tangential to, the pare
 
 The child shares the parent's working directory. Tool actions can change files visible to the parent. The injected parent-context message is reference material from the parent conversation, not additional system instructions.`;
 
-type CacheMode = {
-	mode: "native" | "fallback";
-	reason?: string;
-};
-
 function sameStringArray(a: string[], b: string[]): boolean {
 	return a.length === b.length && a.every((value, index) => value === b[index]);
-}
-
-function configuredBtwRoutes(ctx: ExtensionContext): ResolvedTaskRoute[] {
-	try {
-		return resolveConfiguredTaskRoutes(ctx, BTW_TASK);
-	} catch (error) {
-		const { taskRouteCode, profileName } = error as TaskRouteError;
-		throw new Error(
-			taskRouteCode === "profile-missing"
-				? `BTW task profile ${profileName} is not configured. Run /task-models.`
-				: taskRouteCode === "no-route"
-					? `BTW task profile ${profileName} has no available route. Run /task-models.`
-					: "Couldn't read task model config. Run /task-models.",
-		);
-	}
 }
 
 /**
  * Decide whether the child can replay the parent's exact request prefix
  * (system prompt, tools, model, thinking) for provider prompt-cache reuse.
  */
-export function decideCacheMode(
+function decideCacheMode(
 	payload: BtwPayload,
 	actual: { model: string | undefined; activeTools: string[]; thinkingLevel: string },
-): CacheMode {
-	if (payload.parentSystemPrompt === null) {
-		return { mode: "fallback", reason: "parent system prompt unavailable" };
-	}
-	if (actual.model !== payload.metadata.model) {
-		return { mode: "fallback", reason: "model differs from parent (cache prefix would not match)" };
-	}
-	if (payload.config.tools !== "inherit" || !sameStringArray(actual.activeTools, payload.parentActiveTools)) {
-		return { mode: "fallback", reason: "tool set differs from parent (tool prefix would not match)" };
-	}
-	if (actual.thinkingLevel !== payload.parentThinkingLevel) {
-		return { mode: "fallback", reason: "thinking level differs from parent" };
-	}
-	return { mode: "native" };
+): boolean {
+	return (
+		payload.parentSystemPrompt !== null &&
+		actual.model === payload.metadata.model &&
+		payload.config.tools === "inherit" &&
+		sameStringArray(actual.activeTools, payload.parentActiveTools) &&
+		actual.thinkingLevel === payload.parentThinkingLevel
+	);
 }
 
 async function configureChild(
@@ -163,34 +131,16 @@ async function configureChild(
 			)
 		: undefined;
 
-	const cache: CacheMode = { mode: "fallback", reason: "not yet negotiated" };
-	let widgetUi:
-		| { setWidget(name: string, lines: string[]): void; theme: { fg(color: string, text: string): string } }
-		| undefined;
-
-	function renderWidget(): void {
-		if (!widgetUi || !payload) return;
-		const capability =
-			payload.config.tools === "none"
-				? "tool-free"
-				: payload.config.tools === "read-only"
-					? "read-only"
-					: "tool-enabled";
-		widgetUi.setWidget("herdr-btw-context", [
-			widgetUi.theme.fg("accent", `BTW — ${capability} pane`),
-		]);
-	}
+	let nativeCache = false;
 
 	pi.on("before_agent_start", (event, ctx) => {
 		if (!payload) return;
-		const decision = decideCacheMode(payload, {
+		nativeCache = decideCacheMode(payload, {
 			model: ctx.model ? `${ctx.model.provider}/${ctx.model.id}` : undefined,
 			activeTools: pi.getActiveTools(),
 			thinkingLevel: pi.getThinkingLevel(),
 		});
-		cache.mode = decision.mode;
-		cache.reason = decision.reason;
-		if (cache.mode === "native") {
+		if (nativeCache) {
 			// Replay the parent's exact system prompt; side-pane policy moves to
 			// a suffix message so the cached prefix stays byte-identical.
 			return { systemPrompt: payload.parentSystemPrompt as string };
@@ -200,7 +150,7 @@ async function configureChild(
 
 	pi.on("context_with_system", (event) => {
 		if (!payload) return;
-		if (cache.mode === "native") {
+		if (nativeCache) {
 			return {
 				messages: [
 					...(payload.messages[0]?.role === "system" ? [] : event.messages.slice(0, 1)),
@@ -369,8 +319,15 @@ async function configureChild(
 			return;
 		}
 
-		widgetUi = ctx.ui;
-		renderWidget();
+		if (payload) {
+			const capability =
+				payload.config.tools === "none"
+					? "tool-free"
+					: payload.config.tools === "read-only"
+						? "read-only"
+						: "tool-enabled";
+			ctx.ui.setWidget("herdr-btw-context", [ctx.ui.theme.fg("accent", `BTW — ${capability} pane`)]);
+		}
 
 		// Auto-submit drafts are sent via the launch-draft sentinel instead of
 		// here: session_start fires before pi's initial render, and a message
@@ -417,6 +374,14 @@ export async function registerBtwExtension(
 	}
 
 	const configStore = options.configStore ?? createBtwConfigStore();
+	const configReporter = registerConfigReporting(pi, [configStore]);
+	const reportTaskModels = registerTaskModelsConfigReporting(pi);
+	const loadConfig = (ctx: ExtensionContext): BtwConfig => {
+		const loaded = configStore.loadSync();
+		configReporter.report(ctx, configStore, loaded);
+		// No field disables this config: invalid keys fall back to their defaults.
+		return loaded.status === "ok" ? loaded.value : { ...DEFAULT_CONFIG };
+	};
 	const herdr = createHerdrClient<HerdrOptions>(pi.exec.bind(pi));
 
 	// --- Parent-side merge coordination ---------------------------------
@@ -424,7 +389,6 @@ export async function registerBtwExtension(
 		| Pick<ExtensionCommandContext, "sessionManager" | "isIdle" | "model" | "modelRegistry">
 		| undefined;
 	let sessionGeneration = 0;
-	let missingTaskModelsConfigWarningSessionId: string | undefined;
 	// Notifications need a UI context; route them through the last known ctx.
 	let notifyFn: ((message: string, type: "info" | "warning" | "error") => void) | undefined;
 	const coordinator = new MergeCoordinator(store, {
@@ -477,17 +441,6 @@ export async function registerBtwExtension(
 	}
 
 	pi.on("session_start", (_event, ctx) => {
-		const sessionId = ctx.sessionManager.getSessionId();
-		let taskModelsConfig: ReturnType<typeof loadTaskModelsConfig> | undefined;
-		try {
-			taskModelsConfig = loadTaskModelsConfig();
-		} catch {
-			ctx.ui.notify("Couldn't read task model config. Run /task-models.", "warning");
-		}
-		if (missingTaskModelsConfigWarningSessionId !== sessionId && taskModelsConfig?.source === "missing") {
-			missingTaskModelsConfigWarningSessionId = sessionId;
-			ctx.ui.notify("Task model config is missing; run /task-models to configure it.", "warning");
-		}
 		sessionGeneration += 1;
 		sessionCtx = ctx;
 		notifyFn = (message, type) => ctx.ui.notify(message, type);
@@ -543,24 +496,20 @@ export async function registerBtwExtension(
 			if (route.kind === "config") {
 				try {
 					if (route.args === "reset") {
+						// Reset does not depend on the file, but first show the problems that it removes.
+						loadConfig(ctx);
 						const config = { ...DEFAULT_CONFIG };
 						await configStore.save(config);
 						ctx.ui.notify(`BTW config — ${formatConfig(config)}`, "info");
 						return;
 					}
-					const trimmedArgs = route.args.trim();
-					const result = !trimmedArgs || trimmedArgs === "show"
-						? applyConfigCommand(configStore.loadSync().value, route.args)
-						: {
-							action: "save" as const,
-							config: await configStore.update((latest) => applyConfigCommand(latest, route.args).config),
-						};
-					ctx.ui.notify(
-						result.action === "show"
-							? `BTW config — ${formatConfig(result.config)}\n${CONFIG_COMMAND_USAGE}`
-							: `BTW config — ${formatConfig(result.config)}`,
-						"info",
-					);
+					if (!route.args || route.args === "show") {
+						const config = loadConfig(ctx);
+						ctx.ui.notify(`BTW config — ${formatConfig(config)}\n${CONFIG_COMMAND_USAGE}`, "info");
+						return;
+					}
+					const config = await configStore.update((latest) => applyConfigCommand(latest, route.args));
+					ctx.ui.notify(`BTW config — ${formatConfig(config)}`, "info");
 				} catch (error) {
 					const message = error instanceof Error ? error.message : String(error);
 					ctx.ui.notify(message, "error");
@@ -621,14 +570,14 @@ export async function registerBtwExtension(
 
 			let payloadPath: string | undefined;
 			try {
-				const config: BtwConfig = configStore.loadSync().value;
+				const config = loadConfig(ctx);
 				await store.removeStale();
 				const createdAt = new Date().toISOString();
 				const sessionId = ctx.sessionManager.getSessionId();
 				const currentModel = ctx.model ? `${ctx.model.provider}/${ctx.model.id}` : null;
 				const thinkingLevel = pi.getThinkingLevel();
 				let launchRoute: ResolvedTaskRoute | undefined;
-				for (const route of configuredBtwRoutes(ctx)) {
+				for (const route of configuredTaskRoutes(ctx, BTW_TASK, "BTW", reportTaskModels)) {
 					try {
 						const authenticated = (await ctx.modelRegistry.getApiKeyAndHeaders(route.model)).ok;
 						if (launchGeneration !== sessionGeneration) return;
@@ -706,8 +655,7 @@ export async function registerBtwExtension(
 					}
 					return;
 				}
-				const splitOutcome = classifyLaunchResult(splitResult);
-				if (splitOutcome !== "success") {
+				if (splitResult.killed || splitResult.code !== 0) {
 					await store.remove(payloadPath);
 					ctx.ui.notify(
 						`/btw failed: ${safeErrorText(splitResult.stdout, splitResult.stderr)}`,
@@ -749,26 +697,24 @@ export async function registerBtwExtension(
 					}
 					return;
 				}
-				const outcome = classifyLaunchResult(result);
-				if (outcome === "success" && !isAgentStartReady(result.stdout, { name: launchOptions.paneName, paneId })) {
-					await reportKnownPaneFailure(
-						"/btw failed: `herdr agent start` returned an invalid or non-interactive result",
-						paneId,
-						payloadPath,
-					);
-					return;
-				}
-				if (outcome === "success") {
+				if (!result.killed) {
+					if (result.code !== 0) {
+						await reportKnownPaneFailure(
+							`/btw failed: ${safeErrorText(result.stdout, result.stderr)}`,
+							paneId,
+							payloadPath,
+						);
+						return;
+					}
+					if (!isAgentStartReady(result.stdout, { name: launchOptions.paneName, paneId })) {
+						await reportKnownPaneFailure(
+							"/btw failed: `herdr agent start` returned an invalid or non-interactive result",
+							paneId,
+							payloadPath,
+						);
+						return;
+					}
 					ensurePolling();
-					return;
-				}
-
-				if (outcome === "failed") {
-					await reportKnownPaneFailure(
-						`/btw failed: ${safeErrorText(result.stdout, result.stderr)}`,
-						paneId,
-						payloadPath,
-					);
 					return;
 				}
 

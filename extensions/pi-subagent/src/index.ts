@@ -1,5 +1,5 @@
-import { readFileSync, readdirSync } from "node:fs";
-import { isAbsolute, join } from "node:path";
+import { readFileSync, readdirSync, type Dirent } from "node:fs";
+import { basename, isAbsolute, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import {
 	DefaultPackageManager,
@@ -9,8 +9,9 @@ import {
 	type ExtensionAPI,
 	type ExtensionContext,
 } from "@earendil-works/pi-coding-agent";
-import { extensionConfigDir } from "@henryqw/pi-config-store";
+import { createConfigStore, extensionConfigDir, field, formatConfigIssues, parsers, registerConfigReporting, type FieldParser } from "@henryqw/pi-config-store";
 import { hasDisplayControlCharacters } from "./display-text.ts";
+import { DEFAULT_MAX_TURNS } from "./ephemeral.ts";
 import { loadRoleMcpConfig, parseRoleMcpAllowlist } from "./mcp-role.ts";
 import {
 	loadTaskModelsConfig,
@@ -142,6 +143,28 @@ export interface Role {
 	skills: string[];
 	mcps?: string[];
 	systemPrompt: string;
+}
+
+/** Optional `config.json` resources merged into every Role, defaults first. */
+export interface RoleDefaults {
+	extensions?: string[];
+	tools?: string[];
+	skills?: string[];
+}
+
+export type RoleSource = "built-in" | "user override" | "user";
+
+/** One invalid user Role file. `name` is the claimed Role name, or the file stem when unreadable. */
+export interface RoleFileError {
+	file: string;
+	name: RoleName;
+	message: string;
+}
+
+export interface RoleCatalog {
+	roles: Role[];
+	sources: ReadonlyMap<RoleName, RoleSource>;
+	errors: RoleFileError[];
 }
 
 export interface PiLaunch {
@@ -277,6 +300,139 @@ function rejectRetiredRoleIsolation(value: unknown, source: string): void {
 	throw new Error(`${source}: Role isolation is retired; select mode \"isolated\" on delegate_task instead.`);
 }
 
+const ROLE_FRONTMATTER_KEYS = ["name", "description", "modelClass", "tools", "extensions", "skills", "mcps"] as const;
+const ROLE_DEFAULT_KEYS = ["extensions", "tools", "skills"] as const;
+
+/** Validate `config.json` `roleDefaults` with the same rules as Role fields; `label` prefixes errors. */
+export function parseRoleDefaults(value: unknown, label = "roleDefaults"): RoleDefaults {
+	if (!value || typeof value !== "object" || Array.isArray(value)) throw new Error(`${label} must be a JSON object.`);
+	const record = value as Record<string, unknown>;
+	for (const key of Object.keys(record)) {
+		if (!(ROLE_DEFAULT_KEYS as readonly string[]).includes(key)) throw new Error(`${label}: unknown key ${JSON.stringify(key)}; expected ${ROLE_DEFAULT_KEYS.join(", ")}.`);
+	}
+	return {
+		...(record.extensions === undefined ? {} : { extensions: extensionList(record.extensions, label) }),
+		...(record.tools === undefined ? {} : { tools: stringList(record.tools, "tools", label) }),
+		...(record.skills === undefined ? {} : { skills: stringList(record.skills, "skills", label) }),
+	};
+}
+
+/** Per-key `roleDefaults`: an unknown key or invalid list is reported and dropped, so fewer resources load. */
+const roleDefaultsField: FieldParser<RoleDefaults> = (raw, report) => {
+	if (!raw || typeof raw !== "object" || Array.isArray(raw)) throw new Error("must be a JSON object");
+	const defaults: RoleDefaults = {};
+	for (const [key, value] of Object.entries(raw)) {
+		if (!(ROLE_DEFAULT_KEYS as readonly string[]).includes(key)) {
+			report([key], "unknown key", "unknown-key");
+			continue;
+		}
+		try { Object.assign(defaults, parseRoleDefaults({ [key]: value })); }
+		catch (error) { report([key], error instanceof Error ? error.message : String(error)); }
+	}
+	return defaults;
+};
+
+export interface SubagentConfig {
+	maxSubagents: number;
+	maxTurns: number;
+	maxTokens: number | undefined;
+	maxCorrections: number;
+	timeout: { idleMinutes: number; maxMinutes: number };
+	roleDefaults: RoleDefaults;
+}
+
+export const DEFAULT_SUBAGENT_CONFIG: Readonly<SubagentConfig> = Object.freeze({
+	maxSubagents: 5,
+	maxTurns: DEFAULT_MAX_TURNS,
+	maxTokens: undefined,
+	maxCorrections: 1,
+	timeout: Object.freeze({ idleMinutes: 10, maxMinutes: 30 }),
+	roleDefaults: Object.freeze({}),
+});
+
+const timeoutMinutes = parsers.number({ greaterThan: 0, max: 2_147_483_647 / 60_000 });
+const timeoutField: FieldParser<SubagentConfig["timeout"]> = (raw, report) => {
+	const timeout = parsers.object({
+		idleMinutes: field(timeoutMinutes, DEFAULT_SUBAGENT_CONFIG.timeout.idleMinutes),
+		maxMinutes: field(timeoutMinutes, DEFAULT_SUBAGENT_CONFIG.timeout.maxMinutes),
+	})(raw, report);
+	if (timeout.maxMinutes <= timeout.idleMinutes) {
+		throw new Error(`maxMinutes (${timeout.maxMinutes}) must be greater than idleMinutes (${timeout.idleMinutes})`);
+	}
+	return timeout;
+};
+
+/**
+ * The user `config.json` store shared by the extension and `loadRoleCatalog`.
+ * Invalid bounded limits and `roleDefaults` keys fall back to defaults; an
+ * invalid `maxTokens` disables the config because its default is unlimited.
+ */
+export function createSubagentConfigStore(agentDir = getAgentDir()) {
+	return createConfigStore({
+		extensionId: "pi-subagent",
+		agentDir,
+		fields: {
+			maxSubagents: field(parsers.integer({ min: 1 }), DEFAULT_SUBAGENT_CONFIG.maxSubagents),
+			maxTurns: field(parsers.integer({ min: 1 }), DEFAULT_SUBAGENT_CONFIG.maxTurns),
+			maxTokens: field<number | undefined>(parsers.integer({ min: 1 }), undefined, { onInvalid: "disable" }),
+			maxCorrections: field(parsers.integer({ min: 0 }), DEFAULT_SUBAGENT_CONFIG.maxCorrections),
+			timeout: field(timeoutField, DEFAULT_SUBAGENT_CONFIG.timeout),
+			roleDefaults: field(roleDefaultsField, DEFAULT_SUBAGENT_CONFIG.roleDefaults),
+		},
+	});
+}
+
+/**
+ * Read only `roleDefaults`. The extension reports and enforces the execution limits, so a bad limit does not
+ * break the Role catalog of other consumers; other keys are not this reader's issues.
+ */
+function loadRoleDefaults(agentDir: string) {
+	const store = createConfigStore({
+		extensionId: "pi-subagent",
+		agentDir,
+		fields: { roleDefaults: field(roleDefaultsField, DEFAULT_SUBAGENT_CONFIG.roleDefaults) },
+	});
+	const loaded = store.loadSync();
+	const issues = loaded.issues.filter(({ key }) => !key || /^roleDefaults(?![\w$])/.test(key));
+	// A file that cannot load has no trusted `roleDefaults`.
+	return issues.some(({ key }) => !key)
+		? { store, loaded: { status: "disabled" as const, source: loaded.source, issues } }
+		: { store, loaded: { ...loaded, issues } };
+}
+
+function readRoleDefaults(agentDir: string): RoleDefaults {
+	const { store, loaded } = loadRoleDefaults(agentDir);
+	if (loaded.status !== "ok") throw new Error(`${store.path}: ${formatConfigIssues(loaded.issues)}`);
+	return loaded.value.roleDefaults;
+}
+
+/**
+ * Report `roleDefaults` issues at each session start, and return a function that reports them after a lazy
+ * Role catalog load, such as `loadRoleCatalog` or `resolveRoleLaunch`. Every pi-config-store reporter shares
+ * one record, so each issue shows one time in each session, also with the pi-subagent extension active.
+ */
+export function registerRoleDefaultsReporting(
+	pi: Pick<ExtensionAPI, "on">,
+	agentDir = getAgentDir(),
+): (ctx: Pick<ExtensionContext, "hasUI" | "ui">) => void {
+	const target = loadRoleDefaults(agentDir).store;
+	const reporter = registerConfigReporting(pi, []);
+	const report = (ctx: Pick<ExtensionContext, "hasUI" | "ui">) => reporter.report(ctx, target, loadRoleDefaults(agentDir).loaded);
+	pi.on("session_start", (_event, ctx) => report(ctx));
+	return report;
+}
+
+const withDefaults = (defaults: readonly string[] | undefined, values: readonly string[]): string[] => [...new Set([...(defaults ?? []), ...values])];
+
+function applyRoleDefaults(role: Role, defaults: RoleDefaults): Role {
+	return {
+		...role,
+		tools: withDefaults(defaults.tools, role.tools),
+		extensions: withDefaults(defaults.extensions, role.extensions),
+		skills: withDefaults(defaults.skills, role.skills),
+	};
+}
+
 // Built-in Roles resolved from the package-shipped Markdown relative to this module.
 const BUILTIN_ROLE_NAMES = ["implementer", "reviewer", "scout"] as const;
 export type BuiltinRoleName = (typeof BUILTIN_ROLE_NAMES)[number];
@@ -291,6 +447,11 @@ function parseRoleFile(file: string, raw: string): Role {
 	}
 	const frontmatter = parsed.frontmatter;
 	rejectRetiredRoleIsolation(frontmatter.isolation, file);
+	for (const key of Object.keys(frontmatter)) {
+		if (!(ROLE_FRONTMATTER_KEYS as readonly string[]).includes(key)) {
+			throw new Error(`${file}: unknown Role frontmatter key ${JSON.stringify(key)}; expected ${ROLE_FRONTMATTER_KEYS.join(", ")}.`);
+		}
+	}
 	const modelClass = roleModelClass(frontmatter.modelClass, file);
 	return {
 		name: parseRoleName(frontmatter.name, file),
@@ -321,52 +482,88 @@ function builtinRoles(): Role[] {
 	return BUILTIN_ROLE_NAMES.map(loadBuiltinRole);
 }
 
+function claimedRoleName(file: string): RoleName {
+	try {
+		const { name } = parseFrontmatter(readFileSync(file, "utf8")).frontmatter;
+		if (typeof name === "string" && name.trim()) return name.trim();
+	} catch { /* The file's own error is reported; fall back to its stem. */ }
+	return basename(file, ".md");
+}
+
 /**
- * Validated package-shipped Roles plus valid user roles from `config/pi-subagent`.
- * A user role with a built-in name overrides the default; duplicate names among
- * user files are an error. Missing user directory returns the built-ins.
+ * Package-shipped Roles plus user Roles from `config/pi-subagent`, with
+ * `roleDefaults` merged in. A user Role overrides a same-named built-in. Each
+ * invalid or duplicate user file is reported and makes its claimed name
+ * unavailable without hiding valid Roles. Invalid `roleDefaults` keys are
+ * dropped; a `config.json` that cannot load (for example, malformed JSON) throws.
  */
-export function loadRoles(agentDir = getAgentDir()): Role[] {
-	const byName = new Map(builtinRoles().map((role) => [role.name, role]));
+export function loadRoleCatalog(agentDir = getAgentDir()): RoleCatalog {
+	const defaults = readRoleDefaults(agentDir);
+	const builtins = new Map(builtinRoles().map((role) => [role.name, role]));
 	const dir = extensionConfigDir("pi-subagent", agentDir);
-	let entries;
+	let entries: Dirent[] = [];
 	try {
 		entries = readdirSync(dir, { withFileTypes: true });
 	} catch (error: unknown) {
-		if (error && typeof error === "object" && "code" in error && error.code === "ENOENT") return [...byName.values()];
-		throw error;
+		if (!(error && typeof error === "object" && "code" in error && error.code === "ENOENT")) throw error;
 	}
-
-	const userRoles = entries
-		.filter((entry) => entry.name.endsWith(".md") && (entry.isFile() || entry.isSymbolicLink()))
-		.sort((a, b) => a.name.localeCompare(b.name))
-		.map((entry) => readRoleFile(join(dir, entry.name)));
-
-	const names = new Set<string>();
-	for (const role of userRoles) {
-		if (names.has(role.name)) throw new Error(`Duplicate Subagent role: ${role.name}.`);
-		names.add(role.name);
-		byName.set(role.name, role);
+	const user = new Map<RoleName, { file: string; role: Role }[]>();
+	const errors: RoleFileError[] = [];
+	for (const entry of entries
+		.filter((candidate) => candidate.name.endsWith(".md") && (candidate.isFile() || candidate.isSymbolicLink()))
+		.sort((a, b) => a.name.localeCompare(b.name))) {
+		const file = join(dir, entry.name);
+		try {
+			const role = readRoleFile(file);
+			user.set(role.name, [...(user.get(role.name) ?? []), { file, role }]);
+		} catch (error) {
+			errors.push({ file, name: claimedRoleName(file), message: error instanceof Error ? error.message : String(error) });
+		}
 	}
-	return [...byName.values()];
+	for (const [name, files] of user) {
+		if (files.length < 2) continue;
+		for (const { file } of files) errors.push({ file, name, message: `${file}: Duplicate Subagent role: ${name} (${files.map((item) => item.file).join(", ")}).` });
+	}
+	const blocked = new Set(errors.map(({ name }) => name));
+	const sources = new Map<RoleName, RoleSource>();
+	const byName = new Map<RoleName, Role>();
+	for (const [name, role] of builtins) {
+		byName.set(name, user.get(name)?.[0]?.role ?? role);
+		sources.set(name, user.has(name) ? "user override" : "built-in");
+	}
+	for (const [name, files] of user) {
+		if (builtins.has(name)) continue;
+		byName.set(name, files[0]!.role);
+		sources.set(name, "user");
+	}
+	for (const name of blocked) { byName.delete(name); sources.delete(name); }
+	return { roles: [...byName.values()].map((role) => applyRoleDefaults(role, defaults)), sources, errors };
 }
 
+/** Select one catalog Role, naming invalid files that claim it. */
+export function findRole(catalog: RoleCatalog, name: RoleName): Role {
+	const role = catalog.roles.find((candidate) => candidate.name === name);
+	if (role) return role;
+	const invalid = catalog.errors.filter((error) => error.name === name);
+	if (invalid.length) throw new Error(`Subagent role ${name} is unavailable: ${invalid.map(({ message }) => message).join("; ")}`);
+	throw new Error(`Unknown Subagent role: ${name}. Available roles: ${catalog.roles.map((candidate) => candidate.name).join(", ") || "none"}.${catalog.errors.length ? ` ${catalog.errors.length} invalid Role file(s); run /subagent roles.` : ""}`);
+}
+
+type TaskRouteContext = Parameters<typeof resolveTaskModelRoute>[0];
+type RoleLaunchContext = TaskRouteContext & Pick<ExtensionContext, "isProjectTrusted">;
+
 export function resolveTaskRoute(
-	ctx: ExtensionContext,
+	ctx: TaskRouteContext,
 	profileName: ProfileName,
 	agentDir = getAgentDir(),
 ): ResolvedTaskRoute {
-	let config;
-	try {
-		config = loadTaskModelsConfig(agentDir).value;
-	} catch {
-		throw new Error("Couldn't read task model config. Run /task-models.");
-	}
+	// A disabled config throws with the path and the problems.
+	const config = loadTaskModelsConfig(agentDir).value;
 	return resolveConfiguredRoute(ctx, profileName, config.profiles[profileName]);
 }
 
 function resolveConfiguredRoute(
-	ctx: ExtensionContext,
+	ctx: TaskRouteContext,
 	profileName: ProfileName,
 	profile: ReturnType<typeof loadTaskModelsConfig>["value"]["profiles"][ProfileName],
 ): ResolvedTaskRoute {
@@ -479,7 +676,7 @@ function prepareRoleLaunchFromSkills(
 
 function prepareResolvedRoleLaunch(
 	pi: Pick<ExtensionAPI, "getCommands">,
-	ctx: ExtensionContext,
+	ctx: RoleLaunchContext,
 	input: ResolveRoleLaunchInput,
 ): PreparedRoleLaunch {
 	const { task, modelClass, agentDir, ...launchInput } = input;
@@ -494,7 +691,7 @@ function prepareResolvedRoleLaunch(
 
 export function resolveRoleLaunch(
 	pi: Pick<ExtensionAPI, "getCommands">,
-	ctx: ExtensionContext,
+	ctx: RoleLaunchContext,
 	input: ResolveRoleLaunchInput,
 ): ResolvedRoleLaunch {
 	return finalizeRoleLaunch(prepareResolvedRoleLaunch(pi, ctx, input));
@@ -508,17 +705,17 @@ function assertNoMissingRoleSkills(role: Role, launch: ResolvedRoleLaunch): void
 /** Prepare a resolved or resolvable Role launch while keeping its system prompt out of argv. */
 export function prepareRoleLaunch(
 	pi: Pick<ExtensionAPI, "getCommands">,
-	ctx: ExtensionContext,
+	ctx: RoleLaunchContext,
 	input: ResolveRoleLaunchInput,
 ): PreparedRoleLaunch;
 export function prepareRoleLaunch(
 	pi: Pick<ExtensionAPI, "getCommands">,
-	ctx: ExtensionContext,
+	ctx: RoleLaunchContext,
 	input: CreateRoleLaunchInput,
 ): PreparedRoleLaunch;
 export function prepareRoleLaunch(
 	pi: Pick<ExtensionAPI, "getCommands">,
-	ctx: ExtensionContext,
+	ctx: RoleLaunchContext,
 	input: ResolveRoleLaunchInput | CreateRoleLaunchInput,
 ): PreparedRoleLaunch {
 	const role = parseRoleName(input.role.name);
@@ -537,13 +734,12 @@ export function prepareRoleLaunch(
 /** Resolve and prepare a configured Role with its package-owned resources. */
 export async function resolveConfiguredRoleLaunch(
 	pi: Pick<ExtensionAPI, "getCommands">,
-	ctx: ExtensionContext,
+	ctx: RoleLaunchContext & Pick<ExtensionContext, "cwd">,
 	input: ResolveConfiguredRoleLaunchInput,
 ): Promise<PreparedRoleLaunch> {
 	const roleName = parseRoleName(input.role);
 	if (input.modelClass === undefined) throw new Error("Configured Role launch requires an explicit modelClass.");
-	const role = loadRoles().find((role) => role.name === roleName);
-	if (!role) throw new Error(`Required configured Role ${roleName} is missing or ambiguous.`);
+	const role = findRole(loadRoleCatalog(), roleName);
 	if (role.mcps?.length) loadRoleMcpConfig(getAgentDir(), role.mcps, { codemode: roleActivatesCodemode(role.tools) });
 	const resources = await resolveRolePackageResources(role, ctx);
 	const effectiveRole: Role = { ...role, extensions: resources.extensions };

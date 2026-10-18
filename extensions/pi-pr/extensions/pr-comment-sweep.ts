@@ -1,10 +1,11 @@
+import { validateCommitMessage, commitStagedPaths, stageCommitPaths } from "./git-commit.ts";
 import { createHash, randomUUID } from "node:crypto";
-import { realpath, rm } from "node:fs/promises";
+import { rm } from "node:fs/promises";
 import { join } from "node:path";
 import { isDeepStrictEqual } from "node:util";
 import { spawnBounded, type Exec, type ExecOptions } from "@henryqw/pi-process";
 import { markFeedbackHandled } from "./pr-feedback-attention.ts";
-import { PrRun } from "./pr-run.ts";
+import { checkTimeoutMs, PrRun } from "./pr-run.ts";
 import {
 	extensionConfigDir,
 	readTextFileBounded,
@@ -32,6 +33,7 @@ import {
 	type PullRequestLoadContext,
 } from "./pr-github.ts";
 import {
+	canonicalWorktree,
 	extensionExecApi,
 	inspectGitOperation,
 	isAncestor,
@@ -66,6 +68,8 @@ export type SweepLedgerEntry = {
 	kind: FeedbackKind;
 	disposition: SweepDisposition;
 	note: string;
+	/** Already-published PR commit that addressed the item; replies cite it instead of the sweep head. */
+	commit?: string;
 };
 type SweepRunGuard = {
 	epoch: number;
@@ -281,7 +285,7 @@ function parseOwnedPaths(value: unknown): string[] {
 
 function parseLedgerEntry(value: unknown, label: string): SweepLedgerEntry {
 	if (!isRecord(value)) throw new Error(`${label} is invalid`);
-	exactKeys(value, ["id", "kind", "disposition", "note"], label);
+	exactKeys(value, value.commit === undefined ? ["id", "kind", "disposition", "note"] : ["id", "kind", "disposition", "note", "commit"], label);
 	const id = requiredText(value.id, `${label} ID`);
 	if (!["conversation_comment", "review", "thread", "thread_comment"].includes(String(value.kind))) {
 		throw new Error(`${label} kind is invalid`);
@@ -290,7 +294,10 @@ function parseLedgerEntry(value: unknown, label: string): SweepLedgerEntry {
 	if (typeof value.note !== "string" || value.note.includes("\0") || Buffer.byteLength(value.note, "utf8") > LEDGER_NOTE_MAX_BYTES) {
 		throw new Error(`${label} note exceeds ${LEDGER_NOTE_MAX_BYTES} bytes or contains NUL`);
 	}
-	return { id, kind: value.kind as FeedbackKind, disposition: value.disposition as SweepDisposition, note: value.note };
+	const entry: SweepLedgerEntry = { id, kind: value.kind as FeedbackKind, disposition: value.disposition as SweepDisposition, note: value.note };
+	if (value.commit === undefined) return entry;
+	if (entry.disposition !== "addressed") throw new Error(`${label} commit requires an addressed disposition`);
+	return { ...entry, commit: requiredOid(value.commit, `${label} commit`) };
 }
 
 function exactLedger(value: unknown, snapshot: FeedbackSnapshot): SweepLedgerEntry[] {
@@ -375,11 +382,17 @@ function parseProjection(value: unknown): SweepFinalProjection {
 }
 
 function projectionMatches(snapshot: FeedbackSnapshot, projection: SweepFinalProjection): boolean {
-	if (feedbackContentFingerprint(snapshot) !== projection.contentFingerprint) return false;
+	return feedbackContentFingerprint(snapshot) === projection.contentFingerprint && projectionStatesMatch(snapshot, projection);
+}
+
+function projectionStatesMatch(snapshot: FeedbackSnapshot, projection: SweepFinalProjection): boolean {
 	const items = feedbackEntries(snapshot).map(({ id, kind }) => ({ id, kind })).sort((left, right) =>
 		left.id.localeCompare(right.id) || left.kind.localeCompare(right.kind));
-	const threads = snapshot.reviewThreads.map(({ id, isResolved }) => ({ id, isResolved })).sort((left, right) => left.id.localeCompare(right.id));
-	return isDeepStrictEqual(items, projection.items) && isDeepStrictEqual(threads, projection.threads);
+	return isDeepStrictEqual(items, projection.items) && isDeepStrictEqual(threadStates(snapshot), projection.threads);
+}
+
+function threadStates(snapshot: FeedbackSnapshot): { id: string; isResolved: boolean }[] {
+	return snapshot.reviewThreads.map(({ id, isResolved }) => ({ id, isResolved })).sort((left, right) => left.id.localeCompare(right.id));
 }
 
 function resolutionAttempt(value: unknown, index: number, version: number): ResolutionAttempt {
@@ -615,6 +628,11 @@ function carryLedger(before: FeedbackSnapshot, after: FeedbackSnapshot, ledger: 
 		const decision = decisions.get(entry.id);
 		if (old && decision && old.kind === entry.kind) {
 			if (entry.kind !== "thread" && isDeepStrictEqual(old.node, entry.node)) return decision;
+			if (entry.kind === "conversation_comment" && decision.disposition === "non-actionable") {
+				const { body: _oldBody, ...previous } = old.node as FeedbackSnapshot["conversationComments"][number];
+				const { body: _newBody, ...current } = entry.node as FeedbackSnapshot["conversationComments"][number];
+				if (current.author?.__typename === "Bot" && isDeepStrictEqual(previous, current)) return decision;
+			}
 			if (entry.kind === "thread") {
 				// A fixing push can move or obsolete the current anchor without changing the review.
 				// Original anchors remain identity; child comment content is checked separately.
@@ -633,10 +651,15 @@ function carryLedger(before: FeedbackSnapshot, after: FeedbackSnapshot, ledger: 
 	}), after);
 }
 
-function onlyResolutionChanged(before: FeedbackSnapshot, after: FeedbackSnapshot, threadId: string): boolean {
-	if (feedbackContentFingerprint(before) !== feedbackContentFingerprint(after)) return false;
-	const beforeStates = before.reviewThreads.map(({ id, isResolved }) => ({ id, isResolved })).sort((left, right) => left.id.localeCompare(right.id));
-	const afterStates = after.reviewThreads.map(({ id, isResolved }) => ({ id, isResolved })).sort((left, right) => left.id.localeCompare(right.id));
+// Refresh's carry rules: Bot status edits and moved anchors keep every decision; any other change does not.
+function sameDecisions(before: FeedbackSnapshot, after: FeedbackSnapshot, ledger: SweepLedgerEntry[]): boolean {
+	return isDeepStrictEqual(carryLedger(before, after, ledger), ledger);
+}
+
+function onlyResolutionChanged(before: FeedbackSnapshot, after: FeedbackSnapshot, threadId: string, ledger: SweepLedgerEntry[]): boolean {
+	if (!sameDecisions(before, after, ledger)) return false;
+	const beforeStates = threadStates(before);
+	const afterStates = threadStates(after);
 	if (beforeStates.length !== afterStates.length) return false;
 	let changed = 0;
 	for (let index = 0; index < beforeStates.length; index += 1) {
@@ -689,8 +712,7 @@ export class PullRequestCommentSweep {
 	}
 
 	private async location(): Promise<{ root: string; id: string; path: string }> {
-		const top = parseSingleOutputLine((await runChecked(this.exec, "git", ["rev-parse", "--show-toplevel"], this.options())).stdout, "Git worktree root");
-		const root = await realpath(top);
+		const root = await canonicalWorktree(this.cwd, this.signal, this.exec);
 		const id = createHash("sha256").update(root).digest("hex");
 		return { root, id, path: join(extensionConfigDir("pi-pr", this.agentDir), "sweep", id, STATE_FILE) };
 	}
@@ -866,7 +888,7 @@ export class PullRequestCommentSweep {
 			await this.save(location, state);
 			try {
 				await runChecked(this.exec, "git", ["diff", "--check", state.original.head, head], this.options());
-				for (const check of checks) await runChecked(this.exec, check.command, check.args, this.options());
+				for (const check of checks) await runChecked(this.exec, check.command, check.args, this.options({ timeoutMs: checkTimeoutMs(this.run) }));
 				await this.currentAuthority(state.authority, state.original.lease, true);
 				await this.requireCleanPublication(state, head);
 			} catch (error) { this.run.checksFailed(); throw error; }
@@ -900,6 +922,12 @@ export class PullRequestCommentSweep {
 		state.ledger = carryLedger(state.feedback.snapshot, after, state.ledger, replyId);
 		this.setFeedback(state, after);
 		state.projection = buildProjection(state.feedback.generation, after, state.ledger);
+	}
+
+	// Adopts feedback whose decisions and thread states the projection already covers.
+	private adoptFeedback(state: SweepState, snapshot: FeedbackSnapshot): void {
+		this.setFeedback(state, snapshot);
+		if (state.projection) state.projection = { ...state.projection, contentFingerprint: state.feedback.contentFingerprint };
 	}
 
 	private setFeedback(state: SweepState, snapshot: FeedbackSnapshot, generation = state.feedback.generation): void {
@@ -1019,7 +1047,8 @@ export class PullRequestCommentSweep {
 			}
 			const current = await this.collect(state.authority, state.publicationHead);
 			const thread = current.reviewThreads.find(({ id }) => id === attempt.threadId);
-			if (!thread || (attempt.step === "resolve" && feedbackContentFingerprint(current) !== state.feedback.contentFingerprint)) {
+			const unchanged = sameDecisions(state.feedback.snapshot, current, state.ledger!);
+			if (!thread || (attempt.step === "resolve" && !unchanged)) {
 				throw new Error("Resolution attempt feedback generation changed during recovery");
 			}
 			if (attempt.step === "reply" && attempt.replyId &&
@@ -1027,15 +1056,15 @@ export class PullRequestCommentSweep {
 				this.applyReply(state, current, attempt.threadId, attempt.replyId);
 				attempt.state = "applied";
 				attempt.afterFingerprint = state.feedback.fingerprint;
-			} else if (feedbackFingerprint(current) === state.feedback.fingerprint) {
+			} else if (unchanged && isDeepStrictEqual(threadStates(current), threadStates(state.feedback.snapshot))) {
 				attempt.state = "blocked";
 			} else if (attempt.step === "reply") {
 				// Without the returned ID an identical comment cannot prove this attempt succeeded.
 				throw new Error("Reply attempt outcome is ambiguous; recovery is preserved without replaying the reply");
-			} else if (thread.isResolved && onlyResolutionChanged(state.feedback.snapshot, current, attempt.threadId)) {
+			} else if (thread.isResolved && onlyResolutionChanged(state.feedback.snapshot, current, attempt.threadId, state.ledger!)) {
 				attempt.state = "applied";
 				attempt.afterFingerprint = feedbackFingerprint(current);
-				this.setFeedback(state, current);
+				this.adoptFeedback(state, current);
 			} else {
 				throw new Error("Resolution attempt outcome is not exactly reconcilable");
 			}
@@ -1095,6 +1124,16 @@ export class PullRequestCommentSweep {
 		}, { agentDir: this.agentDir, signal: this.signal });
 	}
 
+	// A cited commit must already be published in this PR: reachable from the PR head but not from its base.
+	private async requireCitedCommits(ledger: SweepLedgerEntry[], head: string, base: string): Promise<void> {
+		for (const { id, commit } of ledger) {
+			if (commit && (!(await isAncestor(this.exec, this.options(), commit, head)) ||
+				await isAncestor(this.exec, this.options(), commit, base))) {
+				throw new Error(`Cited commit for ${id} is not a published commit of this pull request: ${commit}`);
+			}
+		}
+	}
+
 	async record(guard: SweepRunGuard, ledgerInput: SweepLedgerEntry[], ownedPathsInput?: string[]): Promise<SweepStatus> {
 		return await withWorktreeLock(this.cwd, async () => {
 			const location = await this.location();
@@ -1105,6 +1144,7 @@ export class PullRequestCommentSweep {
 				await this.requireCleanPublication(state, state.original.head);
 				await this.currentAuthority(state.authority, state.original.lease, true);
 				state.ledger = exactLedger(ledgerInput, state.feedback.snapshot);
+				await this.requireCitedCommits(state.ledger, state.original.head, state.authority.base.oid);
 				state.approved = true;
 				state.approvalGeneration = state.feedback.generation;
 				state.ownedPaths = parseOwnedPaths(ownedPathsInput);
@@ -1114,6 +1154,7 @@ export class PullRequestCommentSweep {
 				await this.requireCleanPublication(state, state.publicationHead!);
 				await this.currentAuthority(state.authority, state.publicationHead!);
 				state.ledger = exactLedger(ledgerInput, state.feedback.snapshot);
+				await this.requireCitedCommits(state.ledger, state.publicationHead!, state.authority.base.oid);
 				state.approved = true;
 				state.approvalGeneration = state.feedback.generation;
 				state.projection = buildProjection(state.feedback.generation, state.feedback.snapshot, state.ledger);
@@ -1127,7 +1168,7 @@ export class PullRequestCommentSweep {
 	}
 
 	async commit(guard: SweepRunGuard, message: string): Promise<{ head: string }> {
-		requiredText(message, "commit message");
+		validateCommitMessage(message);
 		return await withWorktreeLock(this.cwd, async () => {
 			const location = await this.location();
 			const state = await this.loadState(location);
@@ -1144,7 +1185,7 @@ export class PullRequestCommentSweep {
 			const paths = await this.localPaths();
 			if (paths.some((path) => !state.ownedPaths.includes(path))) throw new Error("Comment sweep found changes outside owned paths before staging");
 			if (!paths.length) throw new Error("Comment sweep has no pending changes to commit; validate and publish the existing HEAD");
-			await runChecked(this.exec, "git", ["--literal-pathspecs", "add", "-A", "--", ...paths], this.options());
+			await stageCommitPaths(this.exec, this.options(), paths);
 			await this.requireOwnedLocalState(state, beforeHead);
 			const tree = requiredOid(parseSingleOutputLine((await runChecked(this.exec, "git", ["write-tree"], this.options())).stdout, "Commit tree"), "commit tree");
 			const attempt: CommitAttempt = { state: "attempting", beforeHead, tree, head: null };
@@ -1157,7 +1198,7 @@ export class PullRequestCommentSweep {
 				if (parseSingleOutputLine((await runChecked(this.exec, "git", ["write-tree"], this.options())).stdout, "Commit tree") !== tree) {
 					throw new Error("Comment sweep index changed before commit");
 				}
-				await runChecked(this.exec, "git", ["commit", "-m", message], this.options());
+				await commitStagedPaths(this.exec, this.options(), message);
 				const head = await this.verifyCommit(attempt);
 				await this.requireCleanPublication(state, head);
 				attempt.head = head;
@@ -1307,7 +1348,7 @@ export class PullRequestCommentSweep {
 			const replyBodies = new Map(threadIds.filter((threadId) => !hasReply(threadId)).map((threadId) => {
 				const entry = ledger.get(threadId)!;
 				return [threadId, entry.disposition === "addressed"
-					? state.publicationHead!
+					? entry.commit ?? state.publicationHead!
 					: entry.note.trim()] as const;
 			}));
 			const reserveBytes = [...replyBodies.values()].reduce((total, body) =>
@@ -1321,9 +1362,11 @@ export class PullRequestCommentSweep {
 				await this.requireCleanPublication(state, state.publicationHead);
 				await this.currentAuthority(state.authority, state.publicationHead);
 				const before = await this.collect(state.authority, state.publicationHead);
-				if (feedbackFingerprint(before) !== state.feedback.fingerprint || feedbackContentFingerprint(before) !== state.feedback.contentFingerprint) {
-					throw new Error("Complete feedback generation or fingerprint changed before thread resolution");
+				if (!sameDecisions(state.feedback.snapshot, before, state.ledger) ||
+					!isDeepStrictEqual(threadStates(before), threadStates(state.feedback.snapshot))) {
+					throw new Error("Feedback changed before thread resolution; call refresh, then resolve and finalize");
 				}
+				this.adoptFeedback(state, before);
 				await this.currentAuthority(state.authority, state.publicationHead);
 				await this.requireCleanPublication(state, state.publicationHead);
 				const thread = before.reviewThreads.find(({ id }) => id === threadId);
@@ -1382,7 +1425,7 @@ export class PullRequestCommentSweep {
 					after = await this.collect(state.authority, state.publicationHead);
 					await this.currentAuthority(state.authority, state.publicationHead);
 					await this.requireCleanPublication(state, state.publicationHead);
-					if (!onlyResolutionChanged(beforeResolution, after, threadId)) {
+					if (!onlyResolutionChanged(beforeResolution, after, threadId, state.ledger)) {
 						throw new Error(`Thread resolution did not produce the exact verified transition: ${threadId}`);
 					}
 				} catch (error) {
@@ -1392,7 +1435,7 @@ export class PullRequestCommentSweep {
 				}
 				attempt.state = "applied";
 				attempt.afterFingerprint = feedbackFingerprint(after);
-				this.setFeedback(state, after);
+				this.adoptFeedback(state, after);
 				await this.save(location, state);
 			}
 			if (projectionMatches(state.feedback.snapshot, state.projection)) state.phase = "resolved";
@@ -1408,8 +1451,14 @@ export class PullRequestCommentSweep {
 		const snapshot = await this.collect(state.authority, state.publicationHead);
 		await this.currentAuthority(state.authority, state.publicationHead);
 		await this.requireCleanPublication(state, state.publicationHead);
-		if (!projectionMatches(snapshot, state.projection)) throw new Error("Fresh complete feedback does not match the declared final projection");
-		this.setFeedback(state, snapshot);
+		const unchanged = sameDecisions(state.feedback.snapshot, snapshot, state.ledger!);
+		if (!unchanged || !projectionStatesMatch(snapshot, state.projection)) {
+			const pending = unchanged ? state.projection.threads.filter(({ id, isResolved }) => isResolved &&
+				[state.feedback.snapshot, snapshot].every(({ reviewThreads }) => reviewThreads.some((thread) => thread.id === id && !thread.isResolved))) : [];
+			if (pending.length) throw new Error(`Call resolve before finalize; review threads are still unresolved: ${pending.map(({ id }) => id).join(", ")}`);
+			throw new Error("Feedback changed after refresh; call refresh, then resolve and finalize");
+		}
+		this.adoptFeedback(state, snapshot);
 		state.phase = "resolved";
 	}
 
@@ -1446,7 +1495,7 @@ export class PullRequestCommentSweep {
 				for (const check of checks) {
 					let result;
 					try {
-						result = await this.exec(check.command, check.args, this.options());
+						result = await this.exec(check.command, check.args, this.options({ timeoutMs: checkTimeoutMs(this.run) }));
 					} catch (error) {
 						this.run.checksFailed();
 						state.attempts.finalize.state = "unknown";

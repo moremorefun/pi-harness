@@ -1,3 +1,4 @@
+import { validateCommitMessage, commitStagedPaths, inspectPendingCommit, requirePendingCommit, stageCommitPaths, type PendingCommit } from "./git-commit.ts";
 import type { PrRun } from "./pr-run.ts";
 import { spawnBounded, type Exec, type ExecOptions } from "@henryqw/pi-process";
 import {
@@ -22,13 +23,12 @@ import {
 } from "./pr-routing.ts";
 import {
 	extensionExecApi,
-	inspectWorktree,
 	inspectWorktreeState,
-	parseNulPaths,
 	parseStatusSnapshot,
 	validatePaths,
 	isAncestor,
 	isRecord,
+	parseGraphQLResponse,
 	parseSingleOutputLine,
 	readHead,
 	readRemoteOid,
@@ -64,7 +64,7 @@ type CreatePullRequestState = {
 	phase: CreatePhase;
 	base?: CreateBaseAuthority;
 	createAuthority?: CrossRepositoryCreateAuthority;
-	pending?: { head: string; status: string };
+	pending?: PendingCommit;
 	publicationHead?: string;
 	verifiedHead?: string;
 };
@@ -76,6 +76,8 @@ type CreatePullRequestResult =
 	| { kind: "published"; url: string };
 
 export type CreatePullRequestOptions = {
+	preserveExistingMetadata?: boolean;
+	expectedBase?: string;
 	run?: PrRun;
 	cwd: string;
 	target: PullRequestTarget;
@@ -91,30 +93,12 @@ function sameTarget(left: PullRequestTarget, right: PullRequestTarget, expectedR
 		left.fetchSource === right.fetchSource && right.remoteOid === expectedRemoteOid;
 }
 
-function graphQlResponse(output: string, action: string): Record<string, unknown> {
-	let value: unknown;
-	try {
-		value = JSON.parse(output);
-	} catch {
-		throw new Error(`${action} returned invalid GraphQL output`);
-	}
-	if (!isRecord(value)) throw new Error(`${action} returned invalid GraphQL output`);
-	const errors = value.errors;
-	if (errors !== undefined) {
-		if (!Array.isArray(errors) || errors.some((error) => !isRecord(error) || typeof error.message !== "string" || !error.message)) {
-			throw new Error(`${action} returned invalid GraphQL errors`);
-		}
-		if (errors.length) throw new Error(`${action} failed: ${errors.map((error) => error.message).join("; ")}`);
-	}
-	return value;
-}
-
 function parseCreateAuthority(
 	output: string,
 	baseRepository: string,
 	headRepository: string,
 ): CrossRepositoryCreateAuthority {
-	const response = graphQlResponse(output, "PR creation preflight");
+	const response = parseGraphQLResponse(output, "PR creation preflight failed");
 	const data = response.data;
 	const base = isRecord(data) ? data.base : undefined;
 	const head = isRecord(data) ? data.head : undefined;
@@ -145,7 +129,7 @@ function parseCreateAuthority(
 }
 
 function parseCreatedUrl(output: string, host: string, baseRepository: string): URL {
-	const response = graphQlResponse(output, "Create pull request");
+	const response = parseGraphQLResponse(output, "Create pull request failed");
 	const data = response.data;
 	const mutation = isRecord(data) ? data.createPullRequest : undefined;
 	const pullRequest = isRecord(mutation) ? mutation.pullRequest : undefined;
@@ -164,6 +148,8 @@ function parseCreatedUrl(output: string, host: string, baseRepository: string): 
 export class PullRequestCreator {
 	readonly state: CreatePullRequestState = { phase: "unprepared" };
 
+	private readonly preserveExistingMetadata: boolean;
+	private readonly expectedBase?: string;
 	private readonly run?: PrRun;
 	private readonly cwd: string;
 	private readonly target: PullRequestTarget;
@@ -175,6 +161,8 @@ export class PullRequestCreator {
 	private readonly load: Load;
 
 	constructor(options: CreatePullRequestOptions) {
+		this.preserveExistingMetadata = options.preserveExistingMetadata === true;
+		this.expectedBase = options.expectedBase;
 		this.cwd = options.cwd;
 		this.run = options.run;
 		this.target = { ...options.target };
@@ -228,7 +216,7 @@ export class PullRequestCreator {
 	}
 
 	private async requireCleanHead(): Promise<string> {
-		if (await inspectWorktree(this.exec, this.options()) !== "clean") {
+		if (await inspectWorktreeState(this.exec, this.options()) !== "clean") {
 			throw new Error("PR creation requires a clean worktree with no Git operation in progress");
 		}
 		return await readHead(this.exec, this.options());
@@ -252,6 +240,9 @@ export class PullRequestCreator {
 				throw new Error("PR creation requires at least one commit ahead of the selected base or pending work");
 			}
 			const { base } = preflight;
+			if (this.expectedBase && base.ref !== this.expectedBase) {
+				throw new Error(`Requested base ${this.expectedBase} differs from selected base ${base.ref}; set branch gh-merge-base only with explicit permission`);
+			}
 			this.state.base = {
 				host: base.host,
 				repository: base.repository,
@@ -281,11 +272,10 @@ export class PullRequestCreator {
 		if (this.state.phase !== "prepared") throw new Error("PR creation must be prepared before inspecting pending work");
 		return await withWorktreeLock(this.cwd, async () => {
 			await this.freshNone();
-			if (await inspectWorktreeState(this.exec, this.options()) === "operation") throw new Error("Git operation in progress");
-			const head = await readHead(this.exec, this.options());
-			const status = (await runChecked(this.exec, "git", ["status", "--porcelain=v2", "-z", "--untracked-files=all"], this.options())).stdout;
+			const pending = await inspectPendingCommit(this.exec, this.options());
+			const { head, status } = pending;
 			const paths = validatePaths([...parseStatusSnapshot(status).keys()], "Pending paths");
-			this.state.pending = { head, status };
+			this.state.pending = pending;
 			return { paths, head };
 		}, { agentDir: this.agentDir, signal: this.signal });
 	}
@@ -296,20 +286,17 @@ export class PullRequestCreator {
 		if (!paths.length || paths.some((path) => !parseStatusSnapshot(this.state.pending!.status).has(path))) {
 			throw new Error("Commit paths must be reviewed pending paths");
 		}
-		requiredText(message, "commit message");
+		validateCommitMessage(message);
 		return await withWorktreeLock(this.cwd, async () => {
 			await this.freshNone();
-			if (await readHead(this.exec, this.options()) !== this.state.pending!.head ||
-				await inspectWorktreeState(this.exec, this.options()) === "operation" ||
-				(await runChecked(this.exec, "git", ["status", "--porcelain=v2", "-z", "--untracked-files=all"], this.options())).stdout !== this.state.pending!.status) {
-				throw new Error("Pending work changed after inspection");
-			}
-			const staged = parseNulPaths((await runChecked(this.exec, "git", ["diff", "--cached", "--no-renames", "--name-only", "-z"], this.options())).stdout, "Staged paths");
-			if (staged.some((path) => !paths.includes(path))) throw new Error("Unrelated staged changes require an ownership decision");
-			this.state.pending = undefined; // Commit outcome may be uncertain; never replay it.
-			await runChecked(this.exec, "git", ["--literal-pathspecs", "add", "-A", "--", ...paths], this.options());
-			await runChecked(this.exec, "git", ["commit", "-m", message], this.options());
-			return { head: await readHead(this.exec, this.options()) };
+			await requirePendingCommit(this.exec, this.options(), this.state.pending!);
+			await stageCommitPaths(this.exec, this.options(), paths);
+			this.state.pending = undefined;
+			this.state.phase = "blocked"; // Commit outcome may be uncertain; never replay it.
+			await commitStagedPaths(this.exec, this.options(), message);
+			const head = await readHead(this.exec, this.options());
+			this.state.phase = "prepared";
+			return { head };
 		}, { agentDir: this.agentDir, signal: this.signal });
 	}
 
@@ -437,6 +424,10 @@ export class PullRequestCreator {
 			const before = await this.exactCandidate();
 			if (before && (before.base.repository.toLowerCase() !== this.state.base!.repository.toLowerCase() || before.base.ref !== this.state.base!.ref)) {
 				throw new Error("Exact-head pull request targets a different base");
+			}
+			if (before && this.preserveExistingMetadata) {
+				this.state.phase = "published";
+				return { kind: "published", url: before.url.href };
 			}
 			const repository = `${this.state.base!.host}/${this.state.base!.repository}`;
 			const sameRepository = this.state.base!.repository.toLowerCase() === this.target.repository.toLowerCase();

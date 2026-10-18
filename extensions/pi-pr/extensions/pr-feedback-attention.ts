@@ -1,22 +1,26 @@
 import { createHash } from "node:crypto";
-import { realpath } from "node:fs/promises";
 import { join } from "node:path";
 import { extensionConfigDir, readTextFileBounded, writePrivateTextFileAtomically } from "@henryqw/pi-config-store";
 import { spawnBounded, type Exec } from "@henryqw/pi-process";
 import { collectPullRequestFeedback, feedbackAuthorityFromCurrent, feedbackEntries, type FeedbackSnapshot } from "./pr-feedback.ts";
 import { loadCurrentPullRequest, samePullRequestSnapshot, type CurrentPullRequest } from "./pr-github.ts";
-import { extensionExecApi, isRecord, parseSingleOutputLine, runChecked } from "./pr-execution.ts";
+import { canonicalWorktree, extensionExecApi, isRecord } from "./pr-execution.ts";
+
+// Bot conversation comments are status output (deploys, review progress); bot findings arrive as reviews and threads.
+function attentionEntries(snapshot: FeedbackSnapshot) {
+	return feedbackEntries(snapshot).filter(({ kind, node }) =>
+		kind !== "conversation_comment" || !("author" in node) || node.author?.__typename !== "Bot");
+}
 
 function fingerprint(snapshot: FeedbackSnapshot, blockedIds: ReadonlySet<string> = new Set()): string {
-	const entries = feedbackEntries(snapshot).filter(({ id }) => !blockedIds.has(id)).map(({ id, kind, node }) => ({
+	const entries = attentionEntries(snapshot).filter(({ id }) => !blockedIds.has(id)).map(({ id, kind, node }) => ({
 		id, kind, body: "body" in node ? node.body : null,
 	})).sort((a, b) => a.id.localeCompare(b.id));
 	return createHash("sha256").update(JSON.stringify(entries)).digest("hex");
 }
 
 async function markerPath(cwd: string, agentDir?: string, signal?: AbortSignal, exec: Exec = spawnBounded): Promise<string> {
-	const root = parseSingleOutputLine((await runChecked(exec, "git", ["rev-parse", "--show-toplevel"], { cwd, signal })).stdout, "worktree root");
-	const identity = createHash("sha256").update(await realpath(root)).digest("hex");
+	const identity = createHash("sha256").update(await canonicalWorktree(cwd, signal, exec)).digest("hex");
 	return join(extensionConfigDir("pi-pr", agentDir), "feedback", `${identity}.json`);
 }
 
@@ -51,8 +55,7 @@ export async function needsFeedbackAttention(
 		throw new Error("Feedback discovery cancelled: pull request authority changed");
 	}
 	const marker = await readMarker(await markerPath(cwd, agentDir, signal, exec), signal);
-	const entries = feedbackEntries(snapshot);
-	if (!entries.length) return false;
+	if (!attentionEntries(snapshot).length) return false;
 	return !marker || marker.url !== current.url.href || marker.fingerprint !== fingerprint(snapshot);
 }
 

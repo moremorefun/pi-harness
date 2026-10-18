@@ -4,15 +4,8 @@ import {
 	type ExtensionContext,
 } from "@earendil-works/pi-coding-agent";
 import { createHerdrClient, withWorktreeLock } from "@henryqw/pi-herdr";
-import {
-	executeTaskRoutes,
-	loadTaskModelsConfig,
-	registerModelTask,
-	resolveConfiguredTaskRoutes,
-	type ModelTask,
-	type ResolvedTaskRoute,
-	type TaskRouteError,
-} from "@henryqw/pi-task-models";
+import { executeTaskRoutes, registerModelTask, registerTaskModelsConfigReporting, type ModelTask, type ResolvedTaskRoute } from "@henryqw/pi-task-models";
+import { configuredTaskRoutes } from "./task-models.ts";
 
 const WIDGET_KEY = "pi-herdr-rename";
 const WIDGET_RESULT_MS = 2_000;
@@ -38,21 +31,6 @@ const SEMANTIC_BRANCH = /^[a-z][a-z0-9-]{0,11}\/[a-z0-9]+(?:-[a-z0-9]+)*$/;
 type GeneratedTitle = { display: string; branch: string };
 
 class RenameModelError extends Error {}
-
-function configuredRenameRoutes(ctx: ExtensionContext): ResolvedTaskRoute[] {
-	try {
-		return resolveConfiguredTaskRoutes(ctx, RENAME_TASK);
-	} catch (error) {
-		const { taskRouteCode, profileName } = error as TaskRouteError;
-		throw new RenameModelError(
-			taskRouteCode === "profile-missing"
-				? `Rename task profile ${profileName} is not configured. Run /task-models.`
-				: taskRouteCode === "no-route"
-					? `Rename task profile ${profileName} has no available route. Run /task-models.`
-					: "Couldn't read task model config. Run /task-models.",
-		);
-	}
-}
 
 function validSubject(subject: string): boolean {
 	return /^[a-z0-9]+(?: [a-z0-9]+)*$/.test(subject)
@@ -172,7 +150,7 @@ function recentUserMessages(ctx: ExtensionContext, fallback?: string): string | 
 	return selected.reverse().join("\n\n");
 }
 
-async function generateTitle(text: string, ctx: ExtensionContext, signal: AbortSignal): Promise<GeneratedTitle> {
+async function generateTitle(text: string, ctx: ExtensionContext, signal: AbortSignal, reportTaskModels: (ctx: ExtensionContext) => void): Promise<GeneratedTitle> {
 	const prompt = text.slice(0, MAX_CONTEXT_CHARS);
 	const complete = async (route: ResolvedTaskRoute, messages: Array<{ role: "user"; content: string; timestamp: number }>) => {
 		let response;
@@ -192,7 +170,7 @@ async function generateTitle(text: string, ctx: ExtensionContext, signal: AbortS
 	};
 
 	return executeTaskRoutes(
-		configuredRenameRoutes(ctx),
+		configuredTaskRoutes(ctx, RENAME_TASK, "Rename", reportTaskModels),
 		async (route) => {
 			const firstMessages = [{ role: "user" as const, content: prompt, timestamp: Date.now() }];
 			const response = await complete(route, firstMessages);
@@ -225,6 +203,7 @@ async function generateTitle(text: string, ctx: ExtensionContext, signal: AbortS
 
 export default function herdrRenameExtension(pi: ExtensionAPI): void {
 	registerModelTask(pi, RENAME_TASK);
+	const reportTaskModels = registerTaskModelsConfigReporting(pi);
 	const herdr = createHerdrClient<{ signal: AbortSignal }>(pi.exec.bind(pi));
 	let latestUserText: string | undefined;
 	let automaticStarted = false;
@@ -326,7 +305,7 @@ export default function herdrRenameExtension(pi: ExtensionAPI): void {
 		}
 		const { request, controller } = begin();
 		try {
-			const title = await generateTitle(text, ctx, controller.signal);
+			const title = await generateTitle(text, ctx, controller.signal, reportTaskModels);
 			if (!isCurrent(request, controller)) return;
 			const saved = savedTitle(ctx);
 			const previousDisplayTitle = saved && pi.getSessionName() === saved.display ? saved.display : undefined;
@@ -358,19 +337,6 @@ export default function herdrRenameExtension(pi: ExtensionAPI): void {
 		sequence++;
 		automaticPending = false;
 		latestUserText = latestSessionUserText(ctx);
-		try {
-			const taskModels = loadTaskModelsConfig();
-			if (taskModels.source === "missing") {
-				ctx.ui.notify("Task model config is missing; run /task-models to configure rename routing.", "warning");
-			} else {
-				const profileName = taskModels.value.tasks[RENAME_TASK.id] ?? RENAME_TASK.defaultProfile;
-				if (!taskModels.value.profiles[profileName]) {
-					ctx.ui.notify(`Configure rename task profile ${profileName} with /task-models.`, "warning");
-				}
-			}
-		} catch {
-			ctx.ui.notify("Couldn't read task model config. Run /task-models.", "warning");
-		}
 		const title = pi.getSessionName();
 		automaticStarted = Boolean(title || latestUserText);
 		const saved = savedTitle(ctx);
@@ -394,7 +360,8 @@ export default function herdrRenameExtension(pi: ExtensionAPI): void {
 	});
 
 	pi.on("before_agent_start", (event, ctx) => {
-		if (automaticStarted || !automaticPending || !event.prompt.trim()) return;
+		// Runs started by a custom message have no prompt; wait for the user prompt run.
+		if (automaticStarted || !automaticPending || !("prompt" in event) || !event.prompt.trim()) return;
 		automaticPending = false;
 		automaticStarted = true;
 		latestUserText = event.prompt.slice(0, MAX_MESSAGE_CHARS);

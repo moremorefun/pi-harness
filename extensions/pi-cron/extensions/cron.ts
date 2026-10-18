@@ -2,17 +2,19 @@ import { randomUUID } from "node:crypto";
 import { mkdir, stat } from "node:fs/promises";
 import { dirname, join } from "node:path";
 import { getAgentDir, type ExtensionAPI, type ExtensionCommandContext, type ExtensionContext } from "@earendil-works/pi-coding-agent";
-import { readTextFileBounded } from "@henryqw/pi-config-store";
+import { readTextFileBounded, registerConfigReporting } from "@henryqw/pi-config-store";
 import {
 	createEphemeralSubagentExecutor,
 	finalizeRoleLaunch,
-	loadRoles,
+	findRole,
+	loadRoleCatalog,
 	prepareRoleLaunch,
+	registerRoleDefaultsReporting,
 	type EphemeralSubagentExecutor,
 	type ResolvedRoleLaunch,
 	type Role,
 } from "@henryqw/pi-subagent";
-import { modelReference, registerModelTask, resolveTaskModelRoute, type ModelTask } from "@henryqw/pi-task-models";
+import { modelReference, registerModelTask, registerTaskModelsConfigReporting, resolveTaskModelRoute, type ModelTask } from "@henryqw/pi-task-models";
 import {
 	cronConfigStore,
 	cronHome,
@@ -56,6 +58,11 @@ export default function cronExtension(pi: ExtensionAPI, options: CronExtensionOp
 	const agentDir = options.agentDir ?? getAgentDir();
 	const now = options.now ?? Date.now;
 	const configStore = cronConfigStore(agentDir);
+	// Registered before this extension's session_start handler so that its first tick shares the launch deduplication.
+	const reporter = registerConfigReporting(pi, [configStore]);
+	// A job loads the Role catalog and task routes; report their owners' config issues too.
+	const reportRoleDefaults = registerRoleDefaultsReporting(pi, agentDir);
+	const reportTaskModels = registerTaskModelsConfigReporting(pi, agentDir);
 	const home = cronHome(agentDir);
 	const state = new StateStore(join(home, "state.json"));
 	const owner = `${process.pid}-${randomUUID()}`;
@@ -63,37 +70,17 @@ export default function cronExtension(pi: ExtensionAPI, options: CronExtensionOp
 	let timer: ReturnType<typeof setInterval> | undefined;
 	let ticking = false;
 	let running = false;
-	let lastConfigError: string | undefined;
-	let executor: { key: string; value: EphemeralSubagentExecutor } | undefined;
+	let lastStateError: string | undefined;
 	// Renewed on session start so a session switch in the same Pi process revives scheduling.
 	let shutdown = new AbortController();
 
 	registerModelTask(pi, CRON_JOB_TASK);
 
-	const executorFor = (limits: Required<Limits>): EphemeralSubagentExecutor => {
-		const key = JSON.stringify(limits);
-		if (executor?.key !== key) {
-			const value = options.executor?.(limits) ?? createEphemeralSubagentExecutor({
-				maxConcurrency: 1,
-				maxTurns: limits.maxTurns,
-				timeout: { idleMs: limits.idleMinutes * 60_000, maxMs: limits.maxMinutes * 60_000 },
-			});
-			executor = { key, value };
-		}
-		return executor.value;
-	};
-
+	/** Each config issue shows once per session; bad jobs are dropped and bad limits use defaults. */
 	const loadConfig = (ctx: ExtensionContext): CronConfig | undefined => {
-		try {
-			const loaded = configStore.loadSync().value;
-			lastConfigError = undefined;
-			return loaded;
-		} catch (error) {
-			const message = `pi-cron config at ${configStore.path} is invalid; jobs are paused until it is fixed: ${errorText(error)}`;
-			if (message !== lastConfigError && ctx.hasUI) ctx.ui.notify(message, "error");
-			lastConfigError = message;
-			return undefined;
-		}
+		const loaded = configStore.loadSync();
+		reporter.report(ctx, configStore, loaded);
+		return loaded.status === "ok" ? loaded.value : undefined;
 	};
 
 	const prepareLaunch = (ctx: ExtensionContext, job: Job, role: Role): ResolvedRoleLaunch => {
@@ -131,11 +118,9 @@ export default function cronExtension(pi: ExtensionAPI, options: CronExtensionOp
 	};
 
 	/** Admit locally before claiming so no shared claim ages in an executor queue. */
-	const runJob = async (ctx: ExtensionContext, config: CronConfig, job: Job, force: boolean): Promise<
-		{ claimed: true; done: Promise<void> } | { claimed: false; done: Promise<void>; reason: string }
-	> => {
+	const runJob = async (ctx: ExtensionContext, config: CronConfig, job: Job, force: boolean): Promise<{ done: Promise<void> } | { reason: string }> => {
 		const signal = shutdown.signal;
-		if (running || signal.aborted) return { claimed: false, done: Promise.resolve(), reason: "A job is already running in this Pi session, or the session is shutting down." };
+		if (running || signal.aborted) return { reason: "A job is already running in this Pi session, or the session is shutting down." };
 		running = true;
 		try {
 			const limits = effectiveLimits(config);
@@ -144,9 +129,9 @@ export default function cronExtension(pi: ExtensionAPI, options: CronExtensionOp
 			});
 			if (!claim) {
 				running = false;
-				return { claimed: false, done: Promise.resolve(), reason: `${job.id} is not due or is already running in another Pi session.` };
+				return { reason: `${job.id} is not due or is already running in another Pi session.` };
 			}
-			return { claimed: true, done: execute(ctx, limits, job, claim, signal).finally(() => { running = false; }) };
+			return { done: execute(ctx, limits, job, claim, signal).finally(() => { running = false; }) };
 		} catch (error) {
 			running = false;
 			throw error;
@@ -161,11 +146,17 @@ export default function cronExtension(pi: ExtensionAPI, options: CronExtensionOp
 			signal.throwIfAborted();
 			const prompt = job.prompt ?? await readTextFileBounded(job.promptFile!, MAX_PROMPT_BYTES, { signal });
 			if (!prompt.trim()) throw new Error(`prompt file ${job.promptFile} is empty.`);
-			const role = loadRoles(agentDir).find((candidate) => candidate.name === job.role);
-			if (!role) throw new Error(`Role ${job.role} is not configured.`);
+			reportRoleDefaults(ctx);
+			const role = findRole(loadRoleCatalog(agentDir), job.role);
+			if (job.model === undefined) reportTaskModels(ctx);
 			const launch = prepareLaunch(ctx, job, role);
 			await mkdir(dirname(sessionFile), { recursive: true, mode: 0o700 });
-			const result = await executorFor(limits).run({
+			const executor = options.executor?.(limits) ?? createEphemeralSubagentExecutor({
+				maxConcurrency: 1,
+				maxTurns: limits.maxTurns,
+				timeout: { idleMs: limits.idleMinutes * 60_000, maxMs: limits.maxMinutes * 60_000 },
+			});
+			const result = await executor.run({
 				signal,
 				prepare: async () => ({
 					launch: { args: sessionLaunchArgs(launch.args, sessionFile), env: { ...launch.env, ...job.env } },
@@ -175,9 +166,8 @@ export default function cronExtension(pi: ExtensionAPI, options: CronExtensionOp
 			});
 			outcome = result.outcome;
 			output = result.outcome === "success"
-				? result.output
+				? `${modelReference(launch.model)} (${launch.thinkingLevel})\n${result.output}`
 				: `${result.errorMessage ?? result.stopReason ?? `exit ${result.exitCode}`}\n${result.output}\n${result.stderr}`;
-			if (result.outcome === "success") output = `${modelReference(launch.model)} (${launch.thinkingLevel})\n${result.output}`;
 		} catch (error) {
 			output = errorText(error);
 		}
@@ -205,9 +195,14 @@ export default function cronExtension(pi: ExtensionAPI, options: CronExtensionOp
 				const job = config.jobs.find((candidate) => candidate.id === id);
 				if (!job || !jobEnabled(job)) continue;
 				try {
-					await (await runJob(latestCtx, config, job, false)).done;
+					const run = await runJob(latestCtx, config, job, false);
+					lastStateError = undefined;
+					if ("done" in run) await run.done;
 				} catch (error) {
-					if (!signal.aborted && latestCtx.hasUI) latestCtx.ui.notify(`pi-cron could not schedule ${job.id}: ${errorText(error)}`, "error");
+					// A broken or locked state file fails every job alike; show each distinct error once.
+					const message = errorText(error);
+					if (message !== lastStateError && !signal.aborted && latestCtx.hasUI) latestCtx.ui.notify(`pi-cron could not schedule ${job.id}: ${message}`, "error");
+					lastStateError = message;
 				}
 			}
 		} finally {
@@ -290,7 +285,7 @@ export default function cronExtension(pi: ExtensionAPI, options: CronExtensionOp
 
 	async function startNow(ctx: ExtensionCommandContext, config: CronConfig, job: Job): Promise<void> {
 		const run = await runJob(ctx, config, job, true);
-		if (!run.claimed) {
+		if ("reason" in run) {
 			ctx.ui.notify(run.reason, "warning");
 			return;
 		}

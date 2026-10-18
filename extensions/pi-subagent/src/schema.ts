@@ -75,7 +75,7 @@ export const ExecuteRequestSchema = Type.Object({
 export const IdOnlySchema = Type.Object({ id: IdSchema }, { additionalProperties: false });
 
 export const ResumeRequestSchema = Type.Union([
-	Type.Object({ id: IdSchema, action: Type.Literal("retry"), taskId: IdSchema }, { additionalProperties: false }),
+	Type.Object({ id: IdSchema, action: Type.Literal("retry"), taskId: IdSchema, instruction: Type.Optional(TextSchema) }, { additionalProperties: false }),
 	Type.Object({ id: IdSchema, action: Type.Literal("verify"), taskId: IdSchema }, { additionalProperties: false }),
 	Type.Object({ id: IdSchema, action: Type.Literal("finalize") }, { additionalProperties: false }),
 ]);
@@ -88,6 +88,7 @@ export const ResumeRequestParameters = Type.Object({
 		ResumeRequestSchema.anyOf[2].properties.action,
 	]),
 	taskId: Type.Optional(IdSchema),
+	instruction: ResumeRequestSchema.anyOf[0].properties.instruction,
 }, { additionalProperties: false });
 
 export type IdOnly = Static<typeof IdOnlySchema>;
@@ -562,6 +563,7 @@ export const StatusOutputSchema = Type.Object({
 			scope: Type.Union([Type.Literal("task"), Type.Literal("final"), Type.Literal("request")]),
 			taskId: Type.Optional(IdSchema),
 			failure: Type.Optional(Type.String()),
+			failedReview: Type.Optional(Type.Object({ verdict: Type.String(), verdictTruncated: Type.Boolean() })),
 		})),
 		createdAt: TimestampSchema,
 		updatedAt: TimestampSchema,
@@ -589,15 +591,12 @@ function normalizeText(value: string, field: string): string {
 	return normalized;
 }
 
-function normalizeRole(value: string, field: string): RoleName {
-	return parseRoleName(value, field);
-}
 
 function normalizeJudgment(judgment: Judgment | undefined, field: string): Judgment | undefined {
 	if (!judgment) return;
 	return {
 		...judgment,
-		role: normalizeRole(judgment.role, `${field}.role`),
+		role: parseRoleName(judgment.role, `${field}.role`),
 		criterion: normalizeText(judgment.criterion, `${field}.criterion`),
 	};
 }
@@ -605,7 +604,7 @@ function normalizeJudgment(judgment: Judgment | undefined, field: string): Judgm
 function normalizeTask(task: TaskRequest, index: number): TaskRequest {
 	const fields = {
 		id: task.id,
-		role: normalizeRole(task.role, `tasks[${index}].role`),
+		role: parseRoleName(task.role, `tasks[${index}].role`),
 		modelClass: task.modelClass,
 		requirements: normalizeText(task.requirements, `tasks[${index}].requirements`),
 		deliverable: normalizeText(task.deliverable, `tasks[${index}].deliverable`),
@@ -743,7 +742,9 @@ export function parseResumeRequest(value: unknown): ResumeRequest {
 			Errors(ResumeRequestSchema, value),
 		);
 	}
-	return value as ResumeRequest;
+	const request = value as ResumeRequest;
+	if ("instruction" in request && request.instruction !== undefined) requireExactAllocationText(request.instruction, "Retry instruction");
+	return request;
 }
 
 export function sameIdentity(left: WorkspaceIdentity, right: WorkspaceIdentity): boolean {
@@ -1037,7 +1038,7 @@ export function parseIntegrationState(value: unknown, request: ExecuteRequest): 
 		if (generation.status === "superseded") {
 			if (!generation.supersededFrom || !generation.failure?.trim() || generation.promotion
 				|| generation.checks || generation.review || generation.combinedTip
-				|| (generation.supersededFrom === "promotion_failed" ? !generation.supersededPromotion : generation.correction || generation.supersededPromotion)) {
+				|| (generation.supersededFrom === "promotion_failed" ? !generation.supersededPromotion : generation.supersededPromotion)) {
 				throw new Error(`Superseded generation ${generation.number} retains usable evidence or lacks its reason.`);
 			}
 		} else if (generation.supersededFrom !== undefined || (promotion ? generation.status !== expectedStatus
@@ -1193,11 +1194,11 @@ export function parseRunState(value: unknown): RunState {
 			}
 			for (let promptIndex = 0; promptIndex < attempt.prompts.length; promptIndex += 1) {
 				const prompt = attempt.prompts[promptIndex]!;
-				if ((prompt.kind === "followup") !== (prompt.instruction !== undefined)) {
-					throw new Error(`Follow-up prompt history for ${definition.id} has invalid instruction evidence.`);
+				if (prompt.kind === "followup" ? prompt.instruction === undefined : prompt.kind === "initial" && prompt.instruction !== undefined) {
+					throw new Error(`Prompt history for ${definition.id} has invalid instruction evidence.`);
 				}
 				if (prompt.instruction !== undefined) {
-					requireExactAllocationText(prompt.instruction, `Follow-up prompt instruction for ${definition.id}`);
+					requireExactAllocationText(prompt.instruction, `Prompt instruction for ${definition.id}`);
 				}
 				if (promptIndex === 0) continue;
 				if (prompt.kind === "initial") throw new Error(`Malformed repeated initial prompt for ${definition.id}.`);
@@ -1357,7 +1358,7 @@ export function parseRunState(value: unknown): RunState {
 			const releasedWithRevisedAttempt = selected?.status === "promoted" && selected.stages.some((stage) =>
 				stage.taskId === candidate.taskId && stage.attempt === candidate.attempt && !sameIdentity(stage.source, candidate.tip))
 				&& attempt?.cleanup.every((step) => step.status === "completed");
-			const releasedAfterRejection = task?.status === "rejected" && attempt?.termination?.status === "terminated"
+			const releasedAfterRejection = (task?.status === "rejected" || attempt?.superseded) && attempt?.termination?.status === "terminated"
 				&& (candidate.worker === "release_pending" || candidate.worker === "released"
 					&& attempt.cleanup.every((step) => step.status === "completed"));
 			if (!attempt || (candidate.worker !== "retained" && !releasedAfterRejection

@@ -2,10 +2,11 @@ import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
 import { mkdir, mkdtemp, readFile, rm, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { join, basename } from "node:path";
 import test from "node:test";
 import type { EphemeralSubagentExecutor } from "@henryqw/pi-subagent";
 import {
+	COMMIT_NUDGE_INSTRUCTION,
 	IsolatedRunner,
 	STATUS_INSPECTION_BUDGET_MS,
 	withTransientLaunch,
@@ -34,6 +35,7 @@ import {
 	type ExecuteRequest,
 	type HostAllocationPlan,
 	type ModelClass,
+	type PromptRecord,
 	type RunState,
 	type TaskRequest,
 	type WorkspaceIdentity,
@@ -100,6 +102,7 @@ class FakeRuntime implements CoordinatorRuntime, HostRuntime, GitRuntime, TaskCa
 	readonly workerResults: WorkerResult[] = [];
 	workerPause?: (call: WorkerCall) => Promise<void>;
 	readonly correctionFailures: string[] = [];
+	readonly correctionInstructions: string[] = [];
 	readonly followupInstructions: string[] = [];
 	readonly terminationCalls: Array<{ workerId: string; candidate: WorkspaceIdentity }> = [];
 	readonly terminationResults: Array<{ outcome: "terminated" } | { outcome: "unknown"; failure: string }> = [];
@@ -297,6 +300,7 @@ class FakeRuntime implements CoordinatorRuntime, HostRuntime, GitRuntime, TaskCa
 		this.workerCalls.push(call);
 		this.workerContextCalls.push({ taskId: input.task.id, contexts: structuredClone(input.contexts) });
 		if (input.kind === "correction" && input.failure !== undefined) this.correctionFailures.push(input.failure);
+		if (input.kind === "correction" && input.instruction !== undefined) this.correctionInstructions.push(input.instruction);
 		if (input.kind === "followup" && input.instruction !== undefined) this.followupInstructions.push(input.instruction);
 		this.changesetCallOrder.push(`worker:${input.kind}:${input.workerId}`);
 		this.activeWorkers += 1;
@@ -869,6 +873,34 @@ test("abort during agent startup waits for durable ownership and terminates that
 	assertParsed(aborted.state);
 });
 
+test("prune reconciles only aborted requests that recorded a removed resource, through the guarded abort path", async (t) => {
+	const { root, runtime, runner } = await harness(t);
+	const checked = new CheckedGitRuntime();
+	runtime.main = await checked.inspectMain({ root }, { signal: new AbortController().signal });
+	runtime.allocateWorktree = checked.allocateWorktree.bind(checked);
+	runtime.inspectTaskCandidate = checked.inspectTaskCandidate.bind(checked);
+	// Distinct task IDs: worktree names derive from the task ID and an allocation token, deterministic here.
+	const retained = async (id: string, taskId: string) => {
+		runtime.workerResults.push({ outcome: "blocked", diagnostic: "No commit." }, { outcome: "blocked", diagnostic: "No commit." });
+		const stopped = await runner.execute(request(id, [changesetTask(taskId)]), root);
+		const worker = changesetState(stopped.state, taskId).attempts[0]!.allocations.find((item) => item.kind === "worktree")!.worktree!;
+		await writeFile(join(worker.path, "scratch.txt"), "retained\n");
+		assert.equal((await runner.abort(id, root)).state.status, "aborted");
+		return worker;
+	};
+	const pruned = await retained("prune-reconciled", "change"),
+		untouched = await retained("prune-untouched", "other");
+	assert.notEqual(pruned.branch, untouched.branch);
+	const status = async (id: string) => (await runner.listRequests(root)).requests.find((item) => item.id === id)!.status;
+	assert.deepEqual([await status("prune-reconciled"), await status("prune-untouched")], ["aborted · retained", "aborted · retained"]);
+	// Simulate /subagent prune removing exactly one recorded checkout and branch.
+	execFileSync("git", ["worktree", "remove", "--force", pruned.path], { cwd: root });
+	execFileSync("git", ["branch", "-D", pruned.branch], { cwd: root });
+	const lines = await runner.reconcilePrunedAborts([root], [basename(pruned.branch)]);
+	assert.deepEqual(lines, ["Reconciled cleanup of aborted request prune-reconciled."]);
+	assert.deepEqual([await status("prune-reconciled"), await status("prune-untouched")], ["aborted", "aborted · retained"]);
+});
+
 test("abort cleans unchanged no-candidate allocations and safely retries retained cleanup", async (t) => {
 	for (const mode of ["clean", "untracked", "ignored", "committed", "interrupted", "termination"] as const) {
 		await t.test(mode, async (t) => {
@@ -1296,6 +1328,67 @@ test("a blocked diagnostic is normalized before same-worker correction", async (
 	assertParsed(result.state);
 });
 
+test("a truncated diagnostic never splits a surrogate pair", async (t) => {
+	const { root, runtime, runner } = await harness(t);
+	runtime.workerResults.push({ outcome: "blocked", diagnostic: `a${"🙂".repeat(3_000)}` });
+
+	const result = await runner.execute(request("surrogate-diagnostic", [changesetTask("change")]), root);
+	const failure = changesetState(result.state, "change").attempts[0]!.prompts[0]!.failure!;
+
+	assert.doesNotMatch(failure, /\p{Cs}/u);
+	assert.ok(failure.endsWith("\n[truncated]"));
+	assert.ok(Buffer.byteLength(failure, "utf8") <= MAX_PERSISTED_RUNTIME_TEXT_BYTES);
+});
+
+test("a dirty finished turn gets one commit nudge without consuming its correction", async (t) => {
+	const { root, runtime, runner, store } = await harness(t);
+	runtime.workerResults.push({ outcome: "uncommitted", diagnostic: "dirty" });
+	runtime.failPreliminaryChecks = 1;
+	let nudgeIntent: PromptRecord | undefined;
+	runtime.workerPause = async (call) => {
+		if (call.kind === "followup") nudgeIntent = changesetState((await store.load(root, "commit-nudge")).state, "change").attempts[0]!.prompts[1];
+	};
+
+	const result = await runner.execute(request("commit-nudge", [changesetTask("change")]), root);
+	const attempt = changesetState(result.state, "change").attempts[0]!;
+
+	assert.deepEqual(runtime.workerCalls.map(({ kind }) => kind), ["initial", "followup", "correction"]);
+	assert.deepEqual(runtime.followupInstructions, [COMMIT_NUDGE_INSTRUCTION]);
+	assert.equal(nudgeIntent?.status, "submitting");
+	assert.equal(attempt.prompts[0]?.failure, "dirty");
+	assert.deepEqual(attempt.prompts[1]?.preCandidate, attempt.prompts[0]?.preCandidate);
+	assert.equal(attempt.prompts[1]?.instruction, COMMIT_NUDGE_INSTRUCTION);
+	assert.equal(result.state.correctionCount, 1);
+	assert.equal(changesetState(result.state, "change").status, "ready_to_integrate");
+	assertParsed(result.state);
+});
+
+test("a turn still dirty after its commit nudge needs attention without another nudge", async (t) => {
+	const { root, runtime, runner } = await harness(t);
+	runtime.workerResults.push({ outcome: "uncommitted", diagnostic: "dirty" }, { outcome: "uncommitted", diagnostic: "still dirty" });
+
+	const result = await runner.execute(request("nudge-still-dirty", [changesetTask("change")]), root);
+	const task = changesetState(result.state, "change");
+
+	assert.deepEqual(runtime.workerCalls.map(({ kind }) => kind), ["initial", "followup"]);
+	assert.equal(task.status, "needs_attention");
+	assert.match(task.failure ?? "", /commit nudge was sent.*uncommitted changes/);
+	assert.equal(task.attempts[0]!.prompts[1]?.failure, "still dirty");
+	assert.equal(result.state.correctionCount, 0);
+	assertParsed(result.state);
+});
+
+test("an ambiguous commit nudge is never replayed", async (t) => {
+	const { root, runtime, runner } = await harness(t);
+	runtime.workerResults.push({ outcome: "uncommitted", diagnostic: "dirty" }, { outcome: "unknown", diagnostic: "lost" });
+
+	const result = await runner.execute(request("ambiguous-nudge", [changesetTask("change")]), root);
+	assert.equal(changesetState(result.state, "change").attempts[0]!.prompts[1]?.status, "ambiguous");
+	await assert.rejects(runner.resume({ id: "ambiguous-nudge", action: "retry", taskId: "change" }, root), /never replayed/);
+	assert.deepEqual(runtime.workerCalls.map(({ kind }) => kind), ["initial", "followup"]);
+	assertParsed((await runner.status("ambiguous-nudge", root)).state);
+});
+
 test("a follow-up queued during a failing follow-up is honored", async (t) => {
 	for (const failure of ["blocked", "check"] as const) {
 		await t.test(failure, async (t) => {
@@ -1570,6 +1663,8 @@ test("failures enter needs_attention and require explicit recovery actions", asy
 		assert.equal(changesetState(stopped.state, "change").attempts.length, 0);
 		assert.equal(runtime.workerCalls.length, 0);
 		assert.deepEqual(stopped.continuation, { id: definition.id, action: "retry", taskId: "change" });
+		await assert.rejects(runner.resume({ id: definition.id, action: "retry", taskId: "change", instruction: "Fix it." }, root),
+			/requires a same-worker correction of a prompted attempt/);
 		assert.equal(Object.hasOwn(stopped.state, "deadline"), false);
 		runtime.clock += 31 * 60_000;
 
@@ -1581,20 +1676,26 @@ test("failures enter needs_attention and require explicit recovery actions", asy
 
 	await t.test("same-worker correction", async (t) => {
 		const { root, runtime, runner } = await harness(t);
-		const definition = request("verify-change", [changesetTask("change", {
+		const definition = request("verify-change", [{ ...changesetTask("change", {
 			judgment: { role: "judge/manual", modelClass: "frontier", criterion: "The retained change is correct." },
-		})]);
+		}), requirements: `Implement the change. ${"Keep unrelated behavior unchanged. ".repeat(60)}`.trim() }]);
 		runtime.reviewVerdicts.push("NEEDS_WORK", "PASS");
 
 		const stopped = await runner.execute(definition, root);
 		assert.equal(stopped.state.status, "needs_attention");
 		assert.deepEqual(stopped.continuation, { id: definition.id, action: "retry", taskId: "change" });
-		const corrected = await runner.resume({ id: definition.id, action: "retry", taskId: "change" }, root);
+		// 32000 three-byte characters pass the schema but overflow the assignment; the correction must stay available.
+		await assert.rejects(runner.resume({ id: definition.id, action: "retry", taskId: "change", instruction: "修".repeat(32_000) }, root),
+			/Worker assignment exceeds/);
+		assert.deepEqual(runtime.workerCalls, [{ taskId: "change", kind: "initial" }]);
+		const corrected = await runner.resume({ id: definition.id, action: "retry", taskId: "change", instruction: "Fix the reviewed finding." }, root);
 		assert.equal(corrected.state.accepted, false);
 		assert.deepEqual(runtime.workerCalls, [
 			{ taskId: "change", kind: "initial" },
 			{ taskId: "change", kind: "correction" },
 		]);
+		assert.deepEqual(runtime.correctionInstructions, ["Fix the reviewed finding."]);
+		assert.equal(changesetState(corrected.state, "change").attempts[0]!.prompts[1]?.instruction, "Fix the reviewed finding.");
 		assert.deepEqual(runtime.reviewCalls.map(({ scope, taskId }) => ({ scope, taskId })), [
 			{ scope: "task", taskId: "change" },
 			{ scope: "task", taskId: "change" },
@@ -1845,6 +1946,9 @@ test("an interrupted text task remains failed until its explicit retry", async (
 	assert.equal(failed.attempts[0]!.cleanup?.outcome, "pruned");
 	assert.equal(calls, 1);
 
+	await assert.rejects(runner.resume({ id: definition.id, action: "retry", taskId: "research", instruction: "Look again." }, root),
+		/cannot take a worker instruction/);
+	assert.equal(calls, 1);
 	const retried = await runner.resume({ id: definition.id, action: "retry", taskId: "research" }, root);
 	const completed = textState(retried.state, "research");
 	assert.equal(retried.state.accepted, true);
@@ -1898,9 +2002,15 @@ class StagingGit extends IntegrationGit {
 		return this.cleanupBlocked ? { outcome: "blocked", failure: "Exact checkout is dirty; inspect the retained worktree." }
 			: { outcome: "ready", value: "removed" };
 	}
-	override async release(_root: string, info: WorktreeInfo, _tip: WorkspaceIdentity,
-		kind: "worktree" | "branch"): Promise<GitOutcome<"removed">> {
-		this.releases.push(`${info.branch}:${kind}`);
+	/** Branches whose checkout and ref were removed outside Pi Subagent. */
+	readonly removed = new Set<string>();
+	override async absent(_root: string, info: WorktreeInfo): Promise<boolean> {
+		return this.removed.has(info.branch);
+	}
+	override async release(_root: string, info: WorktreeInfo, tip: WorkspaceIdentity,
+		kind: "worktree" | "branch"): Promise<GitOutcome<"removed" | "absent">> {
+		this.releases.push(`${info.branch}:${kind}@${tip.head}`);
+		if (this.removed.has(info.branch)) return { outcome: "ready", value: "absent" };
 		return this.releaseBlocked ? { outcome: "blocked", failure: "Owned checkout is dirty." }
 			: { outcome: "ready", value: "removed" };
 	}
@@ -2756,6 +2866,102 @@ test("Main refresh invalidates candidates launched from an old staged snapshot a
 	await assert.rejects(runner.stage({ id, action: "stage", generation: 2, taskId: dependent.taskId,
 		attempt: dependent.attempt, candidate: dependent.tip,
 		expectedTip: refreshed.state.integration.generations[1]!.integrationBase }, root), /stale or unowned candidate/);
+});
+
+test("after a corrected generation is refreshed, release and abort reach a terminal state without manual cleanup", async (t) => {
+	const git = new StagingGit();
+	const { root, runner, runtime } = await harness(t, { integrationGit: git });
+	const id = "refresh-release-abort";
+	const ready = await runner.execute(request(id, [changesetTask("first"),
+		{ ...changesetTask("dependent"), dependsOn: ["first"] }]), root);
+	const first = ready.state.integration.candidates[0]!;
+	const staged = await runner.stage({ id, action: "stage", generation: 1, taskId: "first",
+		attempt: first.attempt, candidate: first.tip, expectedTip: ready.state.main }, root);
+	const snapshot = staged.state.integration.generations[0]!.combinedTip!;
+	const advanced = await runner.integrate({ id, action: "advance", generation: 1, expectedTip: snapshot }, root);
+	const dependent = advanced.state.integration.candidates[1]!;
+	await runner.stage({ id, action: "stage", generation: 1, taskId: "dependent", attempt: dependent.attempt,
+		candidate: dependent.tip, expectedTip: snapshot }, root);
+	git.resolved = true;
+	const combined = (await runner.stage({ id, action: "resolve", generation: 1, taskId: "dependent", attempt: dependent.attempt,
+		candidate: dependent.tip, expectedTip: snapshot }, root)).state.integration.generations[0]!.combinedTip!;
+	runtime.failCombinedExit = true;
+	await runner.integrate({ id, generation: 1, action: "validate", expectedTip: combined }, root);
+	runtime.integrationIdentity = identity("f", combined.branch);
+	const correctedTip = (await runner.integrate({ id, generation: 1, action: "correct", expectedTip: combined }, root))
+		.state.integration.generations[0]!.combinedTip!;
+	await runner.integrate({ id, generation: 1, action: "validate", expectedTip: correctedTip }, root);
+	runtime.main = identity("b");
+	const refreshed = await runner.integrate({ id, generation: 2, action: "refresh", expectedTip: correctedTip,
+		expectedMain: ready.state.main, newMain: runtime.main }, root);
+	assert.deepEqual(refreshed.state.integration.generations[0]?.correction?.to, correctedTip);
+	assertParsed(refreshed.state);
+
+	// The superseded checkout holds the corrected tip, not the last staged tip.
+	await assert.rejects(runner.integrate({ id, generation: 1, action: "release", expectedTip: combined }, root), /exact superseded/);
+	const oldReleased = await runner.integrate({ id, generation: 1, action: "release", expectedTip: correctedTip }, root);
+	assert.deepEqual(oldReleased.state.integration.generations[0]?.cleanup?.map((step) => step.status), ["completed", "completed"]);
+	assert.ok(git.releases.includes(`pi-subagent/subagent-integration:worktree@${correctedTip.head}`));
+	// Refresh invalidated the dependent but left its idle worker running; release stops that exact worker first.
+	const releasedDependent = await runner.integrate({ id, generation: 2, action: "release", taskId: "dependent",
+		attempt: dependent.attempt, expectedTip: dependent.tip }, root);
+	assert.equal(releasedDependent.state.integration.candidates[1]?.worker, "released");
+	assert.equal(changesetState(releasedDependent.state, "dependent").attempts[0]?.termination?.status, "terminated");
+	assert.deepEqual(runtime.terminationCalls.map((call) => call.workerId), ["dependent-agent"]);
+	// The root candidate can still be rejected after its invalidated dependent stopped.
+	const rejected = await runner.stage({ id, action: "reject", generation: 2, taskId: "first", attempt: first.attempt,
+		candidate: first.tip, expectedTip: refreshed.state.integration.generations[1]!.integrationBase }, root);
+	assert.equal(changesetState(rejected.state, "first").status, "rejected");
+	await runner.integrate({ id, generation: 2, action: "release", taskId: "first", attempt: first.attempt, expectedTip: first.tip }, root);
+	// The empty refreshed generation holds no candidate work, so abort releases it.
+	const aborted = await runner.abort(id, root);
+	assert.equal(aborted.state.status, "aborted");
+	assert.deepEqual(aborted.state.integration.generations[1]?.cleanup?.map((step) => step.status), ["completed", "completed"]);
+	assert.equal((await runner.listRequests(root)).requests[0]?.status, "aborted");
+	assertParsed(aborted.state);
+});
+
+test("abort closes a request whose retained checkouts, branches, and workers were removed outside Pi Subagent", async (t) => {
+	const git = new StagingGit();
+	const { root, runner, runtime } = await harness(t, { integrationGit: git });
+	const id = "removed-outside";
+	const ready = await runner.execute(request(id, [changesetTask("first"),
+		{ ...changesetTask("dependent"), dependsOn: ["first"] }]), root);
+	const first = ready.state.integration.candidates[0]!;
+	const staged = await runner.stage({ id, action: "stage", generation: 1, taskId: "first",
+		attempt: first.attempt, candidate: first.tip, expectedTip: ready.state.main }, root);
+	const snapshot = staged.state.integration.generations[0]!.combinedTip!;
+	await runner.integrate({ id, action: "advance", generation: 1, expectedTip: snapshot }, root);
+	runtime.main = identity("b");
+	await runner.integrate({ id, generation: 2, action: "refresh", expectedTip: snapshot,
+		expectedMain: ready.state.main, newMain: runtime.main }, root);
+	// Main then moved to another branch, so no Main-dependent action can reject the root candidate.
+	runtime.main = identity("c", "refs/heads/other");
+	await assert.rejects(runner.abort(id, root), /explicitly rejected and released/);
+	for (const branch of ["first", "dependent", "pi-subagent/subagent-integration"]) git.removed.add(branch);
+	runtime.terminationReconciliations.push({ outcome: "terminated" }, { outcome: "terminated" });
+	const aborted = await runner.abort(id, root);
+	assert.equal(aborted.state.status, "aborted");
+	assert.deepEqual(runtime.terminationCalls, [], "absent workers are reconciled, never closed");
+	assert.deepEqual(aborted.state.integration.candidates.map((item) => [item.decision, item.worker]),
+		[["rejected", "released"], ["rejected", "released"]]);
+	assert.equal(changesetState(aborted.state, "first").status, "rejected");
+	assert.deepEqual(aborted.state.integration.generations.map((generation) => generation.cleanup?.map((step) => step.status)),
+		[["completed", "completed"], ["completed", "completed"]]);
+	assert.equal((await runner.listRequests(root)).requests[0]?.status, "aborted");
+	assertParsed(aborted.state);
+});
+
+test("abort keeps a removed generation whose promotion failed without proved drift", async (t) => {
+	const { runner, root, git, action } = await stagedForPromotion(t, "blocked-promotion-removed");
+	await runner.integrate({ ...action, action: "validate" }, root);
+	git.promoteResult = { outcome: "blocked", failure: "Main is not a fast-forward base." };
+	const failed = await runner.integrate({ ...action, action: "promote" }, root);
+	assert.equal(failed.state.integration.generations[0]?.status, "promotion_failed");
+	for (const branch of ["change", "pi-subagent/subagent-integration"]) git.removed.add(branch);
+	await assert.rejects(runner.abort(action.id, root), /explicitly rejected and released/);
+	const after = await runner.status(action.id, root);
+	assert.deepEqual(after.state, failed.state);
 });
 
 test("two bounded clean Main advances before staging retain both allocations and the original candidate", async (t) => {

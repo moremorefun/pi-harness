@@ -11,7 +11,7 @@ Example paths below are relative to `examples/extensions/`.
 |---|---|---|
 | Small model-callable operation | `registerTool`, narrow TypeBox schema | `hello.ts` |
 | Data consumed by scripts | `outputSchema` + `structuredContent` | Installed `Tools` section |
-| Orchestrate existing tools | `ctx.executeTool()`; list with `ctx.tools` | Installed `Tools` section |
+| Orchestrate existing tools | `ctx.executeTool()`; list with `ctx.tools`; declare `reachesTools` | Installed `Tools` and `Tool exposure` sections |
 | Reduce declarations or discover tools | `exposure`, `namespace` | Installed `Tool exposure` section |
 | Deliberate active-set changes | `getActiveTools` / `setActiveTools` | `dynamic-tools.ts`, `tools.ts` |
 | Bound large results | Pi truncation helpers | `truncated-tool.ts` |
@@ -23,6 +23,9 @@ Example paths below are relative to `examples/extensions/`.
   replacing only `content` in a `tool_result` handler drops structured data.
 - Throw for ordinary execution failures. Return `isError: true` when a failure
   must retain structured data. Error-looking text alone is still success.
+- Pi 1.3 rejects malformed completed tool-call arguments before execution.
+  Use native argument validation; do not execute partially parsed arguments.
+  Custom providers and message transforms must preserve `ToolCall.argumentsError`.
 - Nested calls use normal validation/interception but do not add transcript
   entries. Surface needed results in the parent result. Pi aggregates nested
   tool usage; do not count it twice. Report usage for the tool's own model calls.
@@ -51,6 +54,12 @@ active set; unknown names are ignored. Changes reach the next model request.
 Use `getAllTools()` metadata and `sourceInfo`, not name/path guesses. Tool
 annotations are unverified hints, not authorization.
 
+Pi 1.3 restores active tools from the session transcript on resume. A `--tools`
+list with only `+name`/`-name` entries modifies that restored selection. Plain
+names in `--tools`, `--no-tools`, or `--no-builtin-tools` select tools explicitly
+instead. Use native restoration, not a custom resume hook; keep separate
+Role or authorization restrictions.
+
 ## Commands and messages
 
 | Need | API | Example |
@@ -63,6 +72,8 @@ annotations are unverified hints, not authorization.
 | In-process signal, without persistence/replay | Namespaced `pi.events` | `event-bus.ts` |
 
 Validate command arguments; choose message delivery and `triggerTurn`
-deliberately. Session-changing operations are command-context-only: lifecycle
-handlers can deadlock. After replacement, use the fresh `withSession` context;
+deliberately. A starting run counts as busy, also during
+`before_agent_start`: `ctx.isIdle()` is false, `sendMessage` queues into that
+run, and `sendUserMessage` needs `deliverAs`. Session-changing operations are
+command-context-only: lifecycle handlers can deadlock. After replacement, use the fresh `withSession` context;
 after `await ctx.reload()`, do not reuse the old extension runtime.

@@ -13,6 +13,7 @@ import {
 } from "./pr-execution.ts";
 import type {
 	CiStatus,
+	CodexReview,
 	LocalMergeSafety,
 	PullRequest,
 	PullRequestConditions,
@@ -30,6 +31,14 @@ const PR_FIELDS = "id,number,url,state,isDraft,baseRefName,baseRefOid,headRefNam
 const PR_PUBLICATION_FIELDS = "number,url,state,baseRefName,headRefName,headRefOid,headRepository,title,body";
 const PR_DISCOVERY_QUERY = "query($owner:String!,$name:String!,$qualifiedName:String!,$endCursor:String){repository(owner:$owner,name:$name){nameWithOwner ref(qualifiedName:$qualifiedName){name associatedPullRequests(first:100,after:$endCursor){totalCount edges{cursor node{__typename number url state baseRepository{nameWithOwner}headRepository{nameWithOwner}headRefName headRefOid}}pageInfo{hasNextPage startCursor endCursor}}}}}";
 const REVIEW_THREADS_QUERY = "query($id:ID!,$endCursor:String){node(id:$id){...on PullRequest{reviewThreads(first:100,after:$endCursor){nodes{isResolved}pageInfo{hasNextPage endCursor}}}}}";
+const CODEX_REVIEW_THREADS_QUERY = "query($id:ID!,$endCursor:String){node(id:$id){...on PullRequest{reviewThreads(first:100,after:$endCursor){nodes{isResolved comments(first:1){nodes{author{login}body}}}pageInfo{hasNextPage endCursor}}}}}";
+/** GitHub reports the Codex bot as this GraphQL author login and as `<login>[bot]` in REST. */
+const CODEX_LOGIN = "chatgpt-codex-connector";
+const CODEX_REST_LOGIN = `${CODEX_LOGIN}[bot]`;
+const CODEX_BLOCKING_BADGE = /!\[P[01] Badge\]\(/;
+const CODEX_SUMMARY_MARKER = "<!-- codex-pull-request-review-summary -->";
+/** A Code Review row of the summary table: its Status cell, then the short SHA of the reviewed head in the Commit cell. */
+const CODEX_SUMMARY_ROW = /^\|[^|\n]*\*\*Code Review\*\*[^|\n]*\|([^|\n]*)\|\s*`([0-9a-f]{7,64})`\s*\|/gim;
 const BASE_REF_QUERY = "query($owner:String!,$name:String!,$qualifiedName:String!){repository(owner:$owner,name:$name){nameWithOwner ref(qualifiedName:$qualifiedName){name target{oid}}}}";
 const OID = /^(?:[0-9a-f]{40}|[0-9a-f]{64})$/i;
 const FAILED_CHECK_STATES = new Set([
@@ -116,7 +125,8 @@ export type PullRequestObservation = {
 	target: { repository: string; branch: string; remote: string; ref: string };
 };
 
-export type PullRequestLoadContext = { cwd: string; signal?: AbortSignal; rebaseBranch?: string };
+/** `codexReview` adds the Codex review gate reads to open pull request discovery. */
+export type PullRequestLoadContext = { cwd: string; signal?: AbortSignal; rebaseBranch?: string; codexReview?: boolean };
 
 type PullRequestCreationPreflight = {
 	head: string;
@@ -175,7 +185,7 @@ type TargetReadResult =
 	| { kind: "target"; target: PushTarget }
 	| { kind: "missing"; branch: string; remoteNames: string[] }
 	| { kind: "blocked"; issue: "detached" | "target" }
-	| { kind: "inactive" };
+	| { kind: "inactive"; nonGitHubHosts?: string[] };
 
 type LinkConfiguration = {
 	upstreamRemote: string[];
@@ -347,16 +357,6 @@ function hasRepositoryMarker(cwd: string): boolean {
 	}
 }
 
-function parseCommandOutput(value: unknown, action: string): CommandOutput {
-	if (!isRecord(value)) fail(action, "invalid command result");
-	const { stdout, stderr, code, killed } = value;
-	if (
-		typeof stdout !== "string" || typeof stderr !== "string" || typeof code !== "number" ||
-		!Number.isSafeInteger(code) || code < 0 || typeof killed !== "boolean"
-	) fail(action, "invalid command result");
-	return { stdout, stderr, code, killed };
-}
-
 function hasExactKeys(value: Record<string, unknown>, keys: string[]): boolean {
 	const actual = Object.keys(value).sort();
 	const expected = [...keys].sort();
@@ -370,25 +370,29 @@ async function invoke(
 	command: string,
 	args: string[],
 ): Promise<CommandOutput> {
-	let result: unknown;
+	const signal = context.signal;
+	let result: CommandOutput;
 	try {
 		result = await pi.exec(command, args, {
 			cwd: context.cwd,
-			signal: context.signal,
+			signal,
 			timeout: EXEC_TIMEOUT_MS,
 		});
 	} catch {
 		fail(action, "command threw");
 	}
-	return parseCommandOutput(result, action);
+	if (result.killed) {
+		fail(action, signal?.aborted ? "command was cancelled" : `command timed out after ${EXEC_TIMEOUT_MS} ms`);
+	}
+	return result;
 }
 
 function commandFailure(action: string, result: CommandOutput, command?: string): never {
 	if (
-		command === "gh" && !result.killed && result.code !== 0 &&
+		command === "gh" && result.code !== 0 &&
 		result.stderr.includes("GraphQL: API rate limit exceeded")
 	) throw new GitHubRateLimitError();
-	fail(action, result.killed ? "command was cancelled" : `exit code ${result.code}`);
+	fail(action, `exit code ${result.code}`);
 }
 
 async function execute(
@@ -399,7 +403,7 @@ async function execute(
 	args: string[],
 ): Promise<CommandOutput> {
 	const result = await invoke(pi, context, action, command, args);
-	if (result.killed || result.code !== 0) commandFailure(action, result, command);
+	if (result.code !== 0) commandFailure(action, result, command);
 	return result;
 }
 
@@ -852,6 +856,7 @@ function ciStatus(checks: CheckState[]): CiStatus {
 function conditions(
 	candidate: ListedPullRequest,
 	unresolvedThreads: number,
+	codex: CodexReview | undefined,
 ): PullRequestConditions {
 	if (
 		(candidate.mergeable === "MERGEABLE" && candidate.mergeStateStatus === "DIRTY") ||
@@ -877,15 +882,17 @@ function conditions(
 		mergeability: !conflict && (candidate.mergeable === "UNKNOWN" || candidate.mergeStateStatus === "UNKNOWN")
 			? "pending"
 			: "known",
+		...(codex ? { codex } : {}),
 	};
 }
 
-function parseUnresolvedReviewThreads(output: string): number {
+function parseUnresolvedReviewThreads(output: string): { unresolved: number; codexFindings: number } {
 	const pages = parseJson(output, "Read unresolved review threads");
 	if (!Array.isArray(pages) || !pages.length) {
 		fail("Read unresolved review threads", "invalid GitHub CLI output");
 	}
 	let total = 0;
+	let codexFindings = 0;
 	for (const [index, page] of pages.entries()) {
 		if (!isRecord(page)) fail("Read unresolved review threads", "invalid GitHub CLI output");
 		if (page.errors !== undefined) {
@@ -910,11 +917,36 @@ function parseUnresolvedReviewThreads(output: string): number {
 			if (!isRecord(thread) || typeof thread.isResolved !== "boolean") {
 				fail("Read unresolved review threads", "invalid GitHub CLI output");
 			}
-			if (!thread.isResolved) total += 1;
+			if (thread.isResolved) continue;
+			total += 1;
+			if (thread.comments === undefined) continue;
+			if (!isRecord(thread.comments) || !Array.isArray(thread.comments.nodes)) {
+				fail("Read unresolved review threads", "invalid GitHub CLI output");
+			}
+			const [first] = thread.comments.nodes;
+			if (first === undefined) continue;
+			if (!isRecord(first) || typeof first.body !== "string" || (first.author !== null && !isRecord(first.author))) {
+				fail("Read unresolved review threads", "invalid GitHub CLI output");
+			}
+			if (isRecord(first.author) && first.author.login === CODEX_LOGIN && CODEX_BLOCKING_BADGE.test(first.body)) codexFindings += 1;
 		}
 	}
 	if (!Number.isSafeInteger(total)) fail("Read unresolved review threads", "invalid GitHub CLI output");
-	return total;
+	return { unresolved: total, codexFindings };
+}
+
+function parseRestItems(output: string, action: string): Record<string, unknown>[] {
+	const pages = parseJson(output, action);
+	if (!Array.isArray(pages) || !pages.every(Array.isArray)) fail(action, "invalid GitHub CLI output");
+	const items = pages.flat();
+	if (!items.every((item) => isRecord(item) && (item.user === null || isRecord(item.user)))) {
+		fail(action, "invalid GitHub CLI output");
+	}
+	return items as Record<string, unknown>[];
+}
+
+function isCodexAuthor(item: Record<string, unknown>): boolean {
+	return isRecord(item.user) && item.user.login === CODEX_REST_LOGIN;
 }
 
 function parseBaseRefAuthority(
@@ -989,7 +1021,6 @@ async function readConfiguredCreationBaseRef(
 	const result = await invoke(pi, context, "Read creation base configuration", "git", [
 		"config", "--get-all", `branch.${branch}.gh-merge-base`,
 	]);
-	if (result.killed) commandFailure("Read creation base configuration", result);
 	if (result.code === 1 && result.stdout === "" && result.stderr === "") return null;
 	if (result.code !== 0) commandFailure("Read creation base configuration", result);
 	if (result.stderr !== "") fail("Read creation base configuration", "unexpected diagnostic");
@@ -1184,7 +1215,7 @@ async function readRemoteAuthority(
 				? ["remote", "get-url", "--push", "--all", remote]
 				: ["remote", "get-url", "--all", remote];
 			const result = await invoke(pi, context, action, "git", args);
-			if (result.killed || result.code !== 0) commandFailure(action, result);
+			if (result.code !== 0) commandFailure(action, result);
 			const urls = lines(result.stdout, action, `${kind} URL`);
 			if (urls.length !== 1) fail(action, `multiple ${kind} URLs are configured`);
 			return parseRemoteUrl(urls[0], kind);
@@ -1241,7 +1272,6 @@ async function readRemoteHeadOid(
 		fetchSource,
 		`refs/heads/${ref}`,
 	]);
-	if (remoteHead.killed) commandFailure("Read remote push ref", remoteHead);
 	if (remoteHead.code === 2) {
 		if (remoteHead.stdout !== "") fail("Read remote push ref", "invalid absent-ref response");
 		return null;
@@ -1256,7 +1286,6 @@ async function readConfigValues(
 	key: string,
 ): Promise<string[] | null> {
 	const result = await invoke(pi, context, "Read Git configuration", "git", ["config", "--get-all", key]);
-	if (result.killed) commandFailure("Read Git configuration", result);
 	if (result.code === 1 && result.stdout === "") return [];
 	if (result.code !== 0) commandFailure("Read Git configuration", result);
 	try {
@@ -1275,7 +1304,6 @@ async function readBooleanConfigValues(
 	const result = await invoke(pi, context, "Read Git configuration", "git", [
 		"config", "--type=bool", "--get-all", key,
 	]);
-	if (result.killed) commandFailure("Read Git configuration", result);
 	if (result.code === 1 && result.stdout === "") return [];
 	if (result.code !== 0) return null;
 	try {
@@ -1344,7 +1372,6 @@ async function readPushTarget(
 	context: PullRequestLoadContext,
 ): Promise<TargetReadResult> {
 	const worktree = await invoke(pi, context, "Check Git worktree", "git", ["rev-parse", "--is-inside-work-tree"]);
-	if (worktree.killed) commandFailure("Check Git worktree", worktree);
 	const worktreeOutput = worktree.stdout.replace(/\r\n/g, "\n");
 	if (worktree.code === 128 && worktreeOutput === "") {
 		const probe = await invoke(pi, context, "Classify Git worktree", "env", [
@@ -1357,7 +1384,6 @@ async function readPushTarget(
 			"rev-parse",
 			"--is-inside-work-tree",
 		]);
-		if (probe.killed) commandFailure("Classify Git worktree", probe);
 		if (
 			probe.code === 128 && probe.stdout === "" &&
 			probe.stderr.replace(/\r\n/g, "\n") ===
@@ -1369,6 +1395,8 @@ async function readPushTarget(
 	if (worktree.code === 0 && worktreeOutput === "false\n") return { kind: "inactive" };
 	if (worktree.code !== 0) commandFailure("Check Git worktree", worktree);
 	if (worktreeOutput !== "true\n") fail("Check Git worktree", "invalid response");
+	const nonGitHubHosts = await readNonGitHubRemoteHosts(pi, context);
+	if (nonGitHubHosts) return { kind: "inactive", nonGitHubHosts };
 
 	const branchResult = context.rebaseBranch === undefined
 		? await execute(pi, context, "Read current branch", "git", ["branch", "--show-current"])
@@ -1392,7 +1420,6 @@ async function readPushTarget(
 	const remoteNames = normalizedRemotes === "" ? [] : lines(normalizedRemotes, "Read push remotes", "remote");
 	if (pushReference === null) {
 		const branchCheck = await invoke(pi, context, "Read current branch", "git", ["check-ref-format", "--branch", branch]);
-		if (branchCheck.killed) commandFailure("Read current branch", branchCheck);
 		if (branchCheck.code !== 0 || branchCheck.stdout.replace(/\r\n/g, "\n") !== `${branch}\n`) {
 			return { kind: "blocked", issue: "target" };
 		}
@@ -1484,7 +1511,7 @@ async function readUnresolvedReviewThreads(
 	pi: Pick<ExtensionAPI, "exec">,
 	context: PullRequestLoadContext,
 	candidate: ListedPullRequest,
-): Promise<number> {
+): Promise<{ unresolved: number; codexFindings: number }> {
 	const result = await execute(pi, context, "Read unresolved review threads", "gh", [
 		"api",
 		"graphql",
@@ -1493,11 +1520,35 @@ async function readUnresolvedReviewThreads(
 		"--paginate",
 		"--slurp",
 		"-f",
-		`query=${REVIEW_THREADS_QUERY}`,
+		`query=${context.codexReview ? CODEX_REVIEW_THREADS_QUERY : REVIEW_THREADS_QUERY}`,
 		"-F",
 		`id=${candidate.id}`,
 	]);
 	return parseUnresolvedReviewThreads(result.stdout);
+}
+
+/**
+ * Codex reviews every push. It adds EYES while it reviews and edits one summary comment whose latest
+ * Code Review row names the reviewed head. THUMBS_UP is PR-level and can be stale, so only a Completed
+ * row for the current head completes; a missing or unparseable summary counts as running.
+ */
+async function readCodexReviewStatus(
+	pi: Pick<ExtensionAPI, "exec">,
+	context: PullRequestLoadContext,
+	candidate: ListedPullRequest,
+): Promise<CodexReview["status"]> {
+	const issue = `repos/${candidate.base.repository}/issues/${candidate.number}`;
+	const read = async (action: string, endpoint: string) => parseRestItems((await execute(pi, context, action, "gh", [
+		"api", "--hostname", candidate.url.hostname, "--paginate", "--slurp", `${issue}/${endpoint}?per_page=100`,
+	])).stdout, action);
+	const reactions = (await read("Read Codex review reactions", "reactions")).filter(isCodexAuthor);
+	if (reactions.some((reaction) => reaction.content === "eyes")) return "running";
+	const summary = (await read("Read Codex review summary", "comments")).filter((comment) => isCodexAuthor(comment) &&
+		typeof comment.body === "string" && comment.body.startsWith(CODEX_SUMMARY_MARKER)).at(-1);
+	const row = summary ? [...(summary.body as string).matchAll(CODEX_SUMMARY_ROW)].at(-1) : undefined;
+	return row?.[1].includes("**Completed**") && candidate.head.oid.toLowerCase().startsWith(row[2].toLowerCase())
+		? "complete"
+		: "running";
 }
 
 async function readBaseRefOid(
@@ -1554,13 +1605,16 @@ async function loadPullRequestDetails(
 		`refs/heads/${candidate.base.ref}`,
 	]);
 
-	const unresolvedThreads = candidate.lifecycle === "open"
+	const threads = candidate.lifecycle === "open"
 		? await readUnresolvedReviewThreads(pi, context, candidate)
-		: 0;
+		: { unresolved: 0, codexFindings: 0 };
+	const codex: CodexReview | undefined = candidate.lifecycle === "open" && context.codexReview
+		? { status: await readCodexReviewStatus(pi, context, candidate), findings: threads.codexFindings }
+		: undefined;
 	const liveBaseOid = candidate.lifecycle === "open"
 		? await readBaseRefOid(pi, context, candidate)
 		: null;
-	const pullRequestConditions = conditions(candidate, unresolvedThreads);
+	const pullRequestConditions = conditions(candidate, threads.unresolved, codex);
 	const inspected = inspectedLocal ?? await inspectLocalMergeSafety({
 		exec: (command, args, options) => pi.exec(command, args, {
 			...options,
@@ -1726,6 +1780,44 @@ export async function loadCurrentPullRequest(
 	return await loadCurrentPullRequestInternal(pi, context, inspectedLocal, observed);
 }
 
+// Returns the remote hosts when no remote points to github.com or to a host that gh has credentials for.
+async function readNonGitHubRemoteHosts(
+	pi: Pick<ExtensionAPI, "exec">,
+	context: PullRequestLoadContext,
+): Promise<string[] | null> {
+	// Unlike git config, git remote -v applies url.<base>.insteadOf and pushInsteadOf.
+	const result = await invoke(pi, context, "Read remote URLs", "git", ["remote", "-v"]);
+	if (result.code !== 0) return null;
+	const hosts = new Set<string>();
+	for (const line of result.stdout.replace(/\r\n/g, "\n").split("\n")) {
+		const url = /^[^\t]+\t(.*) \((?:fetch|push)\)$/.exec(line)?.[1];
+		if (url === undefined) continue;
+		const host = remoteHost(url);
+		// Keep the normal discovery path for remote forms without a host, such as local paths.
+		if (!host) return null;
+		hosts.add(host);
+	}
+	if (hosts.size === 0 || hosts.has("github.com")) return null;
+	for (const host of hosts) {
+		// gh auth token reads local credentials, including GH_ENTERPRISE_TOKEN, without a network request.
+		const token = await invoke(pi, context, "Read GitHub host credentials", "gh", ["auth", "token", "--hostname", host]);
+		if (token.code === 0) return null;
+	}
+	return [...hosts].sort();
+}
+
+function remoteHost(url: string): string | undefined {
+	if (url.includes("://")) {
+		try {
+			return new URL(url).hostname.toLowerCase() || undefined;
+		} catch {
+			return undefined;
+		}
+	}
+	// scp-like syntax (git@host:owner/repo.git) needs a colon before the first slash.
+	return /^(?:[^@/]+@)?([^:/]+):/.exec(url)?.[1]?.toLowerCase();
+}
+
 async function loadCurrentPullRequestInternal(
 	pi: Pick<ExtensionAPI, "exec">,
 	context: PullRequestLoadContext,
@@ -1734,7 +1826,7 @@ async function loadCurrentPullRequestInternal(
 	creationIdentity?: CreationIdentity,
 ): Promise<CurrentPullRequestDiscovery> {
 	const read = await readPushTarget(pi, context);
-	if (read.kind === "inactive") return { kind: "inactive" };
+	if (read.kind === "inactive") return read;
 	if (read.kind === "blocked") {
 		return { kind: "blocked", issue: { kind: read.issue === "detached" ? "detached-head" : "target-invalid" } };
 	}
@@ -1878,7 +1970,6 @@ export async function readTrackingOid(
 	const result = await invoke(pi, context, "Read remote-tracking ref", "git", [
 		"rev-parse", "--verify", "--quiet", `${trackingRef}^{commit}`,
 	]);
-	if (result.killed) commandFailure("Read remote-tracking ref", result);
 	if (result.code === 1 && result.stdout === "") return null;
 	if (result.code !== 0) commandFailure("Read remote-tracking ref", result);
 	return oid(singleLine(result.stdout, "Read remote-tracking ref", "OID"), "Read remote-tracking ref", "OID");
@@ -1939,7 +2030,6 @@ async function restoreConfigValue(
 	const unset = await invoke(pi, context, "Restore branch upstream", "git", [
 		"config", "--fixed-value", "--unset-all", key, expected,
 	]);
-	if (unset.killed) commandFailure("Restore branch upstream", unset);
 	if (unset.code === 5) {
 		throw new Error("Restore branch upstream failed: branch configuration changed concurrently");
 	}

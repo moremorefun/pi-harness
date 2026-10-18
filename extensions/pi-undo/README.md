@@ -1,6 +1,6 @@
 # `@henryqw/pi-undo`
 
-Return to your latest user prompt so you can edit and retry it without later conversation context. The prompt returns in place instead of requiring a copied new turn.
+Return to your latest user prompt without the later conversation context. You can edit the prompt and send it again. The prompt returns in place, so you do not need to copy it into a new turn.
 
 ## Install
 
@@ -10,8 +10,10 @@ pi install npm:@henryqw/pi-undo
 
 ## Use
 
-Run `/undo` with no arguments. It stops active work, waits for it to finish stopping, and returns to the latest user prompt on the current branch so you can edit or submit it again. It does not select prompts on other branches. If the current branch has no user message, Pi displays `Nothing to undo.`
+Run `/undo` with no arguments. It cancels active work. It waits until the work stops. Then it returns to the latest user prompt on the current branch. You can edit the prompt or submit it again.
+
+The command does not select prompts on other branches. If the current branch has no user message, Pi displays `Nothing to undo.`
 
 ## Limits and recovery
 
-`/undo` rewinds conversation context only; it does not revert filesystem changes. Review or restore any files you need to change separately.
+`/undo` returns only the conversation context to its earlier state. It does not revert filesystem changes. Review or restore files separately if necessary.

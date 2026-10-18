@@ -2,7 +2,10 @@ import { readFile } from "node:fs/promises";
 import { basename, dirname, join } from "node:path";
 import type { ExtensionAPI, ExtensionContext, SessionEntry } from "@earendil-works/pi-coding-agent";
 import { getCapabilities, hyperlink, stripTerminalSequences, truncateToWidth, visibleWidth } from "@earendil-works/pi-tui";
+import { registerConfigReporting } from "@henryqw/pi-config-store";
+import { createOpenInConfigStore } from "./open-in-config.ts";
 import { configuredOpenUri } from "./open.ts";
+import { createFooterConfigStore, paintFooter } from "./footer-config.ts";
 
 const THINKING_COLORS = {
 	minimal: 46,
@@ -15,6 +18,8 @@ const THINKING_COLORS = {
 const QUOTA_STATUS_KEY = "pi-multi-codex";
 const AGENT_TIME_ENTRY = "pi-footer:agent-work";
 const SUBAGENT_BACKGROUND_RESULT = "subagent-background-result";
+// Shorter windows are bursts (non-streamed fallbacks, one large chunk) or too coarse to time.
+const MIN_TPS_WINDOW_MS = 250;
 /** Pi's VIRTUAL_MODEL_API: catalog entries that route each request to a physical model. */
 const VIRTUAL_MODEL_API = "pi-virtual";
 
@@ -28,15 +33,10 @@ function isNonNegativeNumber(value: unknown): value is number {
 }
 
 function subagentBackgroundUsage(details: unknown): CountedUsage | undefined {
-	if (!details || typeof details !== "object" || Array.isArray(details)) return;
-	const usage = (details as Record<string, unknown>).usage;
-	if (!usage || typeof usage !== "object" || Array.isArray(usage)) return;
-	const record = usage as Record<string, unknown>;
-	const cost = record.cost;
-	if (!cost || typeof cost !== "object" || Array.isArray(cost)) return;
-	const total = (cost as Record<string, unknown>).total;
-	if (!isNonNegativeNumber(record.input) || !isNonNegativeNumber(record.output) || !isNonNegativeNumber(total)) return;
-	return { input: record.input, output: record.output, cost: { total } };
+	const usage = (details as { usage?: { input?: unknown; output?: unknown; cost?: { total?: unknown } } } | undefined)?.usage;
+	const total = usage?.cost?.total;
+	if (!isNonNegativeNumber(usage?.input) || !isNonNegativeNumber(usage.output) || !isNonNegativeNumber(total)) return;
+	return { input: usage.input, output: usage.output, cost: { total } };
 }
 
 function formatTokens(count: number): string {
@@ -51,19 +51,19 @@ function formatContext(usage?: { tokens: number | null; contextWindow: number; p
 	return `${formatTokens(usage.tokens)}/${formatTokens(usage.contextWindow)} (${usage.percent.toFixed(1)}%)`;
 }
 
-function wrapUsageParts(parts: string[], width: number): string[] {
+function wrapUsageParts(parts: string[], width: number, separator = " · "): string[] {
 	const lines: string[] = [];
 	let current: string[] = [];
 	for (const part of parts) {
-		const candidate = [...current, part].join(" · ");
+		const candidate = [...current, part].join(separator);
 		if (current.length > 0 && visibleWidth(candidate) > width) {
-			lines.push(current.join(" · "));
+			lines.push(current.join(separator));
 			current = [part];
 		} else {
 			current.push(part);
 		}
 	}
-	if (current.length > 0) lines.push(current.join(" · "));
+	if (current.length > 0) lines.push(current.join(separator));
 	return lines;
 }
 
@@ -208,6 +208,10 @@ function latestResponse(ctx: ExtensionContext): { model: string; thinkingLevel?:
 }
 
 export default function footerExtension(pi: ExtensionAPI): void {
+	const colorStore = createFooterConfigStore();
+	// Launch reporting shows color config issues; the session-start read below sees the same file. Renders read
+	// the open-in config for the checkout link but never notify, so its issues show here too, shared with /open.
+	registerConfigReporting(pi, [colorStore, createOpenInConfigStore()]);
 	let activeMilliseconds = 0;
 	let activeStartedAt: number | undefined;
 	let promptPaused = false;
@@ -266,21 +270,9 @@ export default function footerExtension(pi: ExtensionAPI): void {
 		if (finalizeActive()) pi.appendEntry(AGENT_TIME_ENTRY, activeMilliseconds);
 		await refreshGitStatus?.();
 	});
-	pi.on("session_shutdown", () => {
-		stopRuntimeTimer();
-		activeStartedAt = undefined;
-		promptPaused = false;
-		refreshGitStatus = undefined;
-		activeCodegraphCalls.clear();
-	});
+	pi.on("session_shutdown", stopRuntimeTimer);
 
 	pi.on("session_start", async (_event, ctx) => {
-		stopRuntimeTimer();
-		activeStartedAt = undefined;
-		promptPaused = false;
-		requestRuntimeRender = undefined;
-		refreshGitStatus = undefined;
-		activeCodegraphCalls.clear();
 		// Latest valid entry wins; stored data is untrusted.
 		activeMilliseconds = 0;
 		for (const entry of ctx.sessionManager.getEntries()) {
@@ -328,9 +320,9 @@ export default function footerExtension(pi: ExtensionAPI): void {
 		pi.on("message_end", (event) => {
 			if (event.message.role !== "assistant") return;
 			const output = event.message.usage?.output ?? 0;
-			const seconds = assistantStartedAt === undefined ? 0 : (assistantLastUpdateAt! - assistantStartedAt) / 1000;
+			const milliseconds = assistantStartedAt === undefined ? 0 : assistantLastUpdateAt! - assistantStartedAt;
 			assistantStartedAt = assistantLastUpdateAt = undefined;
-			tps = seconds > 0 ? output / seconds : undefined;
+			tps = milliseconds >= MIN_TPS_WINDOW_MS ? output / (milliseconds / 1000) : undefined;
 		});
 
 		// Session entries are append-only; the leaf also changes on tree navigation.
@@ -368,6 +360,10 @@ export default function footerExtension(pi: ExtensionAPI): void {
 			}
 		};
 
+		// Colors are read once per session start; /reload applies edits
+		const loadedColors = colorStore.loadSync();
+		const footerColors = loadedColors.status === "ok" ? loadedColors.value.colors : {};
+
 		ctx.ui.setFooter((tui, theme, data) => {
 			requestRuntimeRender = () => tui.requestRender();
 			const unsubscribe = data.onBranchChange(() => {
@@ -397,7 +393,7 @@ export default function footerExtension(pi: ExtensionAPI): void {
 					const extensionStatuses = data.getExtensionStatuses();
 					const prStatus = sanitizeStatus(extensionStatuses.get("pi-pr") ?? "");
 					const codegraph = activeCodegraphCalls.size > 0
-						? `${theme.fg("accent", "●")} CG`
+						? `${paintFooter(theme, footerColors.codegraphActive, "accent", "●")} CG`
 						: sanitizeStatus(extensionStatuses.get("pi-codegraph") ?? "");
 					const quotaStatus = sanitizeStatus(extensionStatuses.get(QUOTA_STATUS_KEY) ?? "");
 					const externalStatuses: string[] = [];
@@ -406,43 +402,47 @@ export default function footerExtension(pi: ExtensionAPI): void {
 						const text = sanitizeStatus(value);
 						if (text) externalStatuses.push(text);
 					}
-					const ellipsis = theme.fg("dim", "…");
+					const sep = (text: string) => paintFooter(theme, footerColors.separator, "dim", text);
+					// Previously uncolored joins only take the separator color when it is configured, keeping the default look
+					const plainSep = (text: string) =>
+						footerColors.separator === undefined ? text : paintFooter(theme, footerColors.separator, "dim", text);
+					const ellipsis = sep("…");
 					const usageParts = [
-						`↑ ${formatTokens(input)}`,
-						`↓ ${formatTokens(output)}`,
-						`↺ ${cacheRate === undefined ? "—" : `${cacheRate.toFixed(1)}%`}`,
-						`⚡ ${tps === undefined ? "—" : `${tps.toFixed(1)} t/s`}`,
-						`$ ${cost.toFixed(3)}`,
-						`◔ ${formatContext(contextUsage)}`,
+						paintFooter(theme, footerColors.input, "dim", `↑ ${formatTokens(input)}`),
+						paintFooter(theme, footerColors.output, "dim", `↓ ${formatTokens(output)}`),
+						paintFooter(theme, footerColors.cache, "dim", `↺ ${cacheRate === undefined ? "—" : `${cacheRate.toFixed(1)}%`}`),
+						paintFooter(theme, footerColors.throughput, "dim", `⚡ ${tps === undefined ? "—" : `${tps.toFixed(1)} t/s`}`),
+						paintFooter(theme, footerColors.cost, "dim", `$ ${cost.toFixed(3)}`),
+						paintFooter(theme, footerColors.context, "dim", `◔ ${formatContext(contextUsage)}`),
 					];
-					const usage = theme.fg("dim", usageParts.join(" · "));
+					const usage = usageParts.join(sep(" · "));
 					const thinkingText = (level: string) => {
 						const thinkingColor = THINKING_COLORS[level as keyof typeof THINKING_COLORS];
 						return level === "ultra" ? rainbow(level) : thinkingColor === undefined ? theme.fg("dim", level) : color(level, thinkingColor);
 					};
-					const selected = theme.fg("dim", `${ctx.model?.id ?? "no-model"} • `) + thinkingText(String(ctx.thinkingLevel ?? "off"));
+					const selected = paintFooter(theme, footerColors.model, "dim", `${ctx.model?.id ?? "no-model"}`) + sep(" • ") + thinkingText(String(ctx.thinkingLevel ?? "off"));
 					// Under a virtual selection, show where the latest request went, as Pi's own footer does.
 					const model = ctx.model?.api === VIRTUAL_MODEL_API && routed
-						? selected + theme.fg("dim", ` → ${routed.model}`) + (routed.thinkingLevel ? theme.fg("dim", " • ") + thinkingText(routed.thinkingLevel) : "")
+						? selected + sep(" → ") + paintFooter(theme, footerColors.model, "dim", routed.model) + (routed.thinkingLevel ? sep(" • ") + thinkingText(routed.thinkingLevel) : "")
 						: selected;
 					const elapsed = activeMilliseconds + (activeStartedAt === undefined ? 0 : performance.now() - activeStartedAt);
-					const runtime = theme.fg("dim", `◷ ${formatDuration(elapsed)}`);
-					const identity = branch ? theme.fg("dim", `${repo} · `) : "";
+					const runtime = paintFooter(theme, footerColors.runtime, "dim", `◷ ${formatDuration(elapsed)}`);
+					const identity = branch ? paintFooter(theme, footerColors.repository, "dim", repo) + sep(" · ") : "";
 					const checkout = branch ?? repo;
-					const checkoutLink = openUri && getCapabilities().hyperlinks
-						? hyperlink(theme.fg("accent", checkout), openUri)
-						: theme.fg("dim", checkout);
-					const checkoutStatus = gitSummary.badges ? `${checkoutLink} ${theme.fg("dim", gitSummary.badges)}` : checkoutLink;
-					const identityLine = prStatus ? `${identity}${checkoutStatus} · ${prStatus}` : `${identity}${checkoutStatus}`;
+					const linkUri = getCapabilities().hyperlinks ? openUri : undefined;
+					const checkoutText = paintFooter(theme, footerColors.branch, linkUri ? "accent" : "dim", checkout);
+					const checkoutLink = linkUri ? hyperlink(checkoutText, linkUri) : checkoutText;
+					const checkoutStatus = gitSummary.badges ? `${checkoutLink} ${paintFooter(theme, footerColors.gitStatus, "dim", gitSummary.badges)}` : checkoutLink;
+					const identityLine = prStatus ? `${identity}${checkoutStatus}${plainSep(" · ")}${prStatus}` : `${identity}${checkoutStatus}`;
 					const firstLine = quotaStatus ? align(identityLine, quotaStatus, width, ellipsis) : identityLine;
 					const fitsSingleLine = visibleWidth(usage) + visibleWidth(model) + 2 <= width;
 					const usageLines = fitsSingleLine
 						? [align(usage, model, width, ellipsis)]
-						: [...wrapUsageParts(usageParts, width).map((line) => theme.fg("dim", line)), model];
+						: [...wrapUsageParts(usageParts, width, sep(" · ")), model];
 					const lines = [
 						firstLine,
 						...usageLines,
-						alignRightReserved([codegraph, ...externalStatuses].filter(Boolean).join(" · "), runtime, width, ellipsis),
+						alignRightReserved([codegraph, ...externalStatuses].filter(Boolean).join(plainSep(" · ")), runtime, width, ellipsis),
 					];
 					return lines.map((line) => truncateToWidth(line, width, ellipsis));
 				},

@@ -3,7 +3,8 @@ import { lstat, mkdir, mkdtemp, readdir, readFile, rm, stat, symlink, writeFile 
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
-import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
+import { stripVTControlCharacters } from "node:util";
+import { initTheme, type ExtensionAPI, type ExtensionContext } from "@earendil-works/pi-coding-agent";
 import memoryExtensionImpl, { MEMORY_PREPARE_TASK, MEMORY_REVIEW_TASK } from "../extensions/memory.ts";
 import { ENTRY_DELIMITER, MAX_BATCH_OPERATIONS, MAX_FILE_BYTES, MemoryStore } from "../src/store.ts";
 
@@ -18,6 +19,13 @@ function memoryExtension(api: object): void {
 const CHILD_PAYLOAD_ARG = "--pi-herdr-btw-payload";
 const SESSION_CONTEXT = { ui: { notify() {} } };
 const MEMORY_PROMPT_SECTION = "pi_memory";
+
+initTheme();
+const plainTheme = { fg: (_color: string, text: string) => text, bold: (text: string) => text };
+type CustomFactory = (tui: { requestRender(): void }, theme: typeof plainTheme, keybindings: undefined, done: (value: unknown) => void) => {
+	render(width: number): string[];
+	handleInput(data: string): void;
+};
 
 type PromptEvent = {
 	systemPrompt: string;
@@ -46,7 +54,7 @@ type CapturedTool = {
 	description: string;
 	executionMode?: "sequential" | "parallel";
 	exposure?: string;
-	parameters?: { properties?: { operations?: { maxItems?: number } } };
+	parameters?: Record<string, unknown> & { properties?: { operations?: { maxItems?: number } } };
 	execute(
 		toolCallId: string,
 		params: Record<string, unknown>,
@@ -199,6 +207,16 @@ async function withReviewFixture(
 					return options.select?.(choices);
 				},
 				input: async () => options.input,
+				custom: (factory: CustomFactory) => new Promise((resolve) => {
+					const component = factory({ requestRender() {} }, plainTheme, undefined, resolve);
+					const lines = () => component.render(160).map((line) => stripVTControlCharacters(line).trimEnd());
+					questions.push(lines().join("\n"));
+					void (async () => {
+						const choice = (await options.select?.(lines()))?.replace(/^\s*→?\s*/, "");
+						for (let step = 0; choice && step < 2 && !lines().find((line) => line.includes("→"))?.includes(choice); step++) component.handleInput("\x1b[B");
+						component.handleInput(choice ? "\r" : "\x1b");
+					})();
+				}),
 			},
 		} as unknown as ExtensionContext;
 		await run({ agentDir, memoryDir, tool, ctx, calls, commands, notifications, settled: handlers.get("agent_settled")!, modelSelect: handlers.get("model_select")!, handlers, questions, selections });
@@ -248,7 +266,7 @@ test("/remember rejects invalid preparation and queues busy requests in order", 
 		await remember.handler("first", { ...ctx, isIdle: () => false });
 		await remember.handler("second", { ...ctx, isIdle: () => false });
 		assert.equal(calls.length, 2);
-		await settled({ type: "agent_settled" }, ctx);
+		await settled({ type: "agent_settled", aborted: false }, ctx);
 		assert.deepEqual(calls.slice(2).map((call) => JSON.parse(call.context.messages[0]!.content).candidate), ["first", "second"]);
 		await assert.rejects(readFile(join(memoryDir, "MEMORY.md")), /ENOENT/);
 	});
@@ -265,7 +283,7 @@ test("/remember drains a busy queue with fresh state from earlier queued writes"
 		const remember = commands.get("remember")!;
 		await remember.handler("first", { ...ctx, isIdle: () => false });
 		await remember.handler("second", { ...ctx, isIdle: () => false });
-		await settled({ type: "agent_settled" }, ctx);
+		await settled({ type: "agent_settled", aborted: false }, ctx);
 		assert.equal(await readFile(join(memoryDir, "MEMORY.md"), "utf8"), "first fact");
 		assert.deepEqual(calls.map((call) => JSON.parse(call.context.messages[0]!.content).candidate).filter(Boolean), ["first", "second"]);
 		assert.deepEqual(JSON.parse(calls[2]!.context.messages[0]!.content).entries.memory, ["first fact"]);
@@ -506,19 +524,21 @@ test("/dream stops when the agent becomes busy after reading SYSTEM.md", async (
 
 test("/dream applies an approved exact SYSTEM edit before removing represented whole entries", async () => {
 	await withReviewFixture({
-		system: "Existing global rules.", memory: "promote this rule\n§\nkeep this fact", user: "keep this preference",
+		system: "# Rules\nExisting global rules.", memory: "promote this rule\n§\nkeep this fact", user: "keep this preference",
 		responses: [JSON.stringify({
 			reason: "Global behavior applies to all sessions.",
 			system: { find: "", replace: "\nAlways verify the boundary." },
 			remove: { memory: ["promote this rule"], user: [] },
 		})],
-		select: (choices) => choices.find((choice) => choice.includes("Apply promotion")),
+		select: () => "Approve",
 	}, async ({ agentDir, memoryDir, commands, ctx, calls, notifications, questions }) => {
 		await commands.get("dream")!.handler("", ctx);
 		assert.equal(calls.length, 1);
 		assert.deepEqual(JSON.parse(calls[0]!.context.messages[0]!.content).entries.memory, ["promote this rule", "keep this fact"]);
-		assert.match(questions[0]!, /Always verify the boundary/);
-		assert.equal(await readFile(join(agentDir, "SYSTEM.md"), "utf8"), "Existing global rules.\nAlways verify the boundary.");
+		assert.match(questions[0]!, /Promote memory to SYSTEM\.md .*SYSTEM\.md\n\s*\n\s*Why: Global behavior applies to all sessions\./);
+		assert.match(questions[0]!, /\+\s*3 Always verify the boundary\.\n\s*\n\s*Remove from MEMORY\.md \(now covered by SYSTEM\.md\):\n\s*- promote this rule\n/);
+		assert.match(questions[0]!, /→ Reject\s+Change no files\n\s*Approve\s+Update SYSTEM\.md, delete 1 entry from MEMORY\.md\n/);
+		assert.equal(await readFile(join(agentDir, "SYSTEM.md"), "utf8"), "# Rules\nExisting global rules.\nAlways verify the boundary.");
 		assert.equal(await readFile(join(memoryDir, "MEMORY.md"), "utf8"), "keep this fact");
 		assert.equal(await readFile(join(memoryDir, "USER.md"), "utf8"), "keep this preference");
 		assert.ok(Number.isFinite(Date.parse(JSON.parse(await readFile(join(agentDir, "config", "pi-memory", "dream.json"), "utf8")).lastDreamAt)));
@@ -528,7 +548,7 @@ test("/dream applies an approved exact SYSTEM edit before removing represented w
 
 test("/dream cancellation and source drift preserve SYSTEM, entries, and timestamp", async () => {
 	const promotion = JSON.stringify({ reason: "Global.", system: { find: "", replace: "\nNew rule." }, remove: { memory: ["entry"], user: [] } });
-	await withReviewFixture({ system: "original", memory: "entry", responses: [promotion], select: (choices) => choices[0] }, async ({ agentDir, memoryDir, commands, ctx }) => {
+	await withReviewFixture({ system: "original", memory: "entry", responses: [promotion], select: () => "Reject" }, async ({ agentDir, memoryDir, commands, ctx }) => {
 		await commands.get("dream")!.handler("", ctx);
 		assert.equal(await readFile(join(agentDir, "SYSTEM.md"), "utf8"), "original");
 		assert.equal(await readFile(join(memoryDir, "MEMORY.md"), "utf8"), "entry");
@@ -542,7 +562,7 @@ test("/dream cancellation and source drift preserve SYSTEM, entries, and timesta
 	let memoryPath = "";
 	await withReviewFixture({
 		system: "original", memory: "entry", responses: [promotion],
-		select: async (choices) => { await writeFile(memoryPath, "changed entry"); return choices.find((choice) => choice.includes("Apply promotion")); },
+		select: async () => { await writeFile(memoryPath, "changed entry"); return "Approve"; },
 	}, async ({ agentDir, memoryDir, commands, ctx, notifications }) => {
 		memoryPath = join(memoryDir, "MEMORY.md");
 		await commands.get("dream")!.handler("", ctx);
@@ -574,9 +594,9 @@ test("/dream cancellation during approval prevents SYSTEM and memory writes", as
 	await withReviewFixture({
 		system: "original", memory: "entry",
 		responses: [JSON.stringify({ reason: "Global.", system: { find: "", replace: "\nNew rule." }, remove: { memory: ["entry"], user: [] } })],
-		select: (choices) => {
+		select: () => {
 			controller.abort(new Error("dream cancelled"));
-			return choices.find((choice) => choice.includes("Apply promotion"));
+			return "Approve";
 		},
 	}, async ({ agentDir, memoryDir, commands, ctx, calls, notifications }) => {
 		await commands.get("dream")!.handler("", { ...ctx, signal: controller.signal });
@@ -594,7 +614,7 @@ test("/dream reports a timestamp failure without claiming the approved promotion
 		responses: [JSON.stringify({ reason: "Global.", system: { find: "", replace: "\nNew rule." }, remove: { memory: ["entry"], user: [] } })],
 		select: async (choices) => {
 			await mkdir(statePath);
-			return choices.find((choice) => choice.includes("Apply promotion"));
+			return "Approve";
 		},
 	}, async ({ agentDir, memoryDir, commands, ctx, notifications }) => {
 		statePath = join(agentDir, "config", "pi-memory", "dream.json");
@@ -624,9 +644,9 @@ test("/dream keeps entries and leaves its timestamp unset if removal fails after
 		await withReviewFixture({
 			system: "original", memory: "entry",
 			responses: [JSON.stringify({ reason: "Global.", system: { find: "", replace: "\nNew rule." }, remove: { memory: ["entry"], user: [] } })],
-			select: (choices) => {
+			select: () => {
 				MemoryStore.prototype.applyBatch = async () => ({ success: false, error: "simulated removal failure" });
-				return choices.find((choice) => choice.includes("Apply promotion"));
+				return "Approve";
 			},
 		}, async ({ agentDir, memoryDir, commands, ctx, notifications }) => {
 			await commands.get("dream")!.handler("", ctx);
@@ -683,6 +703,15 @@ test("extension loads a frozen snapshot, dispatches writes, caps retries, and sk
 		assert.equal(memoryTool.executionMode, "sequential");
 		assert.equal(memoryTool.exposure, "model-only");
 		assert.equal(memoryTool.parameters?.properties?.operations?.maxItems, MAX_BATCH_OPERATIONS);
+		assert.equal(memoryTool.parameters?.type, "object");
+		assert.equal(memoryTool.parameters?.additionalProperties, false);
+		assert.ok(memoryTool.parameters?.properties);
+		assert.ok(!("anyOf" in memoryTool.parameters!) && !("oneOf" in memoryTool.parameters!));
+		await assert.rejects(
+			() => memoryTool.execute("mixed", { action: "add", content: "dropped", operations: [{ action: "add", content: "kept" }] }),
+			/Use either operations or top-level action\/content\/old_text, not both/,
+		);
+		assert.equal(await readFile(join(memoryDir, "MEMORY.md"), "utf8"), "stable fact");
 
 		const injected = promptEvent();
 		assert.equal(await before(injected), undefined);
@@ -825,6 +854,14 @@ test("declares a balanced review task and invokes the configured primary route",
 		await assert.rejects(
 			() => tool.execute("unconfigured", { action: "add", content: "candidate" }, undefined, undefined, ctx),
 			/Run \/task-models/,
+		);
+		assert.equal(calls.length, 0);
+
+		// A disabled shared config keeps the pi-task-models message with the path and the problem.
+		await writeFile(join(agentDir, "config", "pi-task-models", "config.json"), "{");
+		await assert.rejects(
+			() => tool.execute("disabled", { action: "add", content: "candidate" }, undefined, undefined, ctx),
+			/Task model config at .*config\.json is disabled: invalid JSON/,
 		);
 		assert.equal(calls.length, 0);
 	});
@@ -1121,14 +1158,14 @@ test("active-response conflicts return pending and ask only after full settlemen
 		const rendered = tool.renderResult(result, { expanded: true }, { fg: (_color, text) => text }, { args: {} }).render(120).join("\n");
 		assert.doesNotMatch(rendered, /✓/);
 		assert.equal(await readFile(join(memoryDir, "MEMORY.md"), "utf8"), "existing");
-		await settled({ type: "agent_settled" }, busy);
+		await settled({ type: "agent_settled", aborted: false }, busy);
 		assert.equal(calls.length, 1);
-		await settled({ type: "agent_settled" }, ctx);
+		await settled({ type: "agent_settled", aborted: false }, ctx);
 		assert.equal(questions.length, 1);
 		assert.equal(calls.length, 3);
 		assert.equal(await readFile(join(memoryDir, "MEMORY.md"), "utf8"), "merged");
 		assert.equal(notifications.at(-1), "Entry replaced.");
-		await settled({ type: "agent_settled" }, ctx);
+		await settled({ type: "agent_settled", aborted: false }, ctx);
 		assert.equal(calls.length, 3);
 	});
 });
@@ -1141,13 +1178,40 @@ test("deferred conflicts drain FIFO and re-review live sources before asking", a
 	}, async ({ memoryDir, tool, ctx, calls, settled, questions }) => {
 		for (const content of ["first", "second"]) await tool.execute(content, { action: "add", content }, undefined, undefined, { ...ctx, isIdle: () => false });
 		await writeFile(join(memoryDir, "MEMORY.md"), "changed externally");
-		await settled({ type: "agent_settled" }, ctx);
+		await settled({ type: "agent_settled", aborted: false }, ctx);
 		const requests = calls.slice(2).map((call) => JSON.parse(call.context.messages[0]!.content));
 		assert.deepEqual(requests.map((request) => request.mutation.content), ["first", "second"]);
 		assert.ok(requests.every((request) => request.sources.memory[0] === "changed externally"));
 		assert.ok(questions.every((question) => question.includes("changed externally")));
 		assert.equal(questions.length, 2);
 		assert.equal(await readFile(join(memoryDir, "MEMORY.md"), "utf8"), "changed externally");
+	});
+});
+
+test("aborted settlement without a signal drops both queues and preserves later commands", async () => {
+	const conflict = JSON.stringify({ verdict: "overlap", source: "memory", evidence: "saved fact", explanation: "Same fact." });
+	await withReviewFixture({
+		responses: [JSON.stringify({ verdict: "distinct", explanation: "New fact." }), conflict,
+			JSON.stringify({ target: "user", content: "later preference" }),
+			JSON.stringify({ verdict: "distinct", explanation: "New preference." })],
+	}, async ({ memoryDir, tool, commands, ctx, calls, settled, questions }) => {
+		await tool.execute("save", { action: "add", content: "saved fact" }, undefined, undefined, ctx);
+		const busy = { ...ctx, isIdle: () => false };
+		await tool.execute("defer", { action: "add", content: "cancelled conflict" }, undefined, undefined, busy);
+		await commands.get("remember")!.handler("cancelled remember", busy);
+		assert.equal(ctx.signal, undefined);
+		await settled({ type: "agent_settled", aborted: true }, ctx);
+		assert.equal(calls.length, 2);
+		assert.deepEqual(questions, []);
+		assert.equal(await readFile(join(memoryDir, "MEMORY.md"), "utf8"), "saved fact");
+		await assert.rejects(readFile(join(memoryDir, "USER.md")), /ENOENT/);
+
+		await settled({ type: "agent_settled", aborted: false }, ctx);
+		assert.equal(calls.length, 2);
+		assert.deepEqual(questions, []);
+		await commands.get("remember")!.handler("later preference", ctx);
+		assert.equal(await readFile(join(memoryDir, "USER.md"), "utf8"), "later preference");
+		assert.equal(calls.length, 4);
 	});
 });
 
@@ -1160,7 +1224,7 @@ test("cancelled or replaced sessions drop pending conflicts without opening UI",
 			await tool.execute("defer", { action: "add", content: "candidate" }, controller.signal, undefined, { ...ctx, isIdle: () => false });
 			if (boundary === "abort") controller.abort();
 			else await handlers.get(boundary)!({ type: boundary }, SESSION_CONTEXT);
-			await settled({ type: "agent_settled" }, ctx);
+			await settled({ type: "agent_settled", aborted: false }, ctx);
 			assert.equal(calls.length, 1, boundary);
 			assert.deepEqual(questions, [], boundary);
 			assert.equal(await readFile(join(memoryDir, "MEMORY.md"), "utf8"), "existing");
@@ -1177,7 +1241,7 @@ test("a new response during deferred approval invalidates the write without an i
 	}, async ({ memoryDir, tool, ctx, settled, handlers }) => {
 		start = handlers.get("before_agent_start")!;
 		await tool.execute("defer", { action: "add", content: "candidate" }, undefined, undefined, { ...ctx, isIdle: () => false });
-		await settled({ type: "agent_settled" }, ctx);
+		await settled({ type: "agent_settled", aborted: false }, ctx);
 		assert.equal(await readFile(join(memoryDir, "MEMORY.md"), "utf8"), "existing");
 	});
 });
@@ -1574,14 +1638,14 @@ test("errors carry match previews/usage, snapshots filter frame tokens, backups 
 	}
 });
 
-test("init failure disables extension silently; oversized and capped snapshots warn instead of injecting", async () => {
+test("invalid config disables memory with a launch error; oversized and capped snapshots warn instead of injecting", async () => {
 	const root = await mkdtemp(join(tmpdir(), "pi-memory-init-"));
 	const agentDir = join(root, "agent");
 	const memoryDir = join(root, "memory");
 	const previousAgentDir = process.env.PI_CODING_AGENT_DIR;
 	process.env.PI_CODING_AGENT_DIR = agentDir;
 	try {
-		// Case 1: config invalid at session_start -> before_agent_start silent, tool errors once.
+		// Case 1: invalid directory at session_start -> launch error, never the default directory.
 		await mkdir(join(agentDir, "config", "pi-memory"), { recursive: true });
 		await writeFile(join(agentDir, "config", "pi-memory", "config.json"), JSON.stringify({ directory: "relative/path" }));
 		const handlers = new Map<string, Handler>();
@@ -1594,7 +1658,12 @@ test("init failure disables extension silently; oversized and capped snapshots w
 		} as unknown as ExtensionAPI);
 		const before = handlers.get("before_agent_start")!;
 		const memoryTool = tool!;
-		await handlers.get("session_start")!({ type: "session_start" }, SESSION_CONTEXT);
+		const launch: Array<[string, string]> = [];
+		await handlers.get("session_start")!({ type: "session_start" }, { hasUI: true, ui: { notify: (message: string, level: string) => launch.push([message, level]) } });
+		assert.equal(launch.length, 1);
+		assert.match(launch[0]![0], /^pi-memory disabled \(.*config\.json\): directory: must be an absolute path/);
+		assert.equal(launch[0]![1], "error");
+		await assert.rejects(lstat(join(agentDir, "config", "pi-memory", "memory")), { code: "ENOENT" });
 		// Failed init stays visible: warning injected every turn, never thrown.
 		const failed = promptEvent();
 		assert.equal(await before(failed), undefined);

@@ -7,7 +7,7 @@ import {
 	getAgentDir,
 	SettingsManager,
 } from "@earendil-works/pi-coding-agent";
-import { createConfigStore } from "@henryqw/pi-config-store";
+import { createConfigStore, field, parsers, registerConfigReporting } from "@henryqw/pi-config-store";
 import type {
 	AgentBeforeSettleEvent,
 	CompactionEntry,
@@ -21,6 +21,7 @@ import type {
 import {
 	executeTaskRoutes,
 	registerModelTask,
+	registerTaskModelsConfigReporting,
 	resolveConfiguredTaskRoutes,
 	type ModelTask,
 	type ResolvedTaskRoute,
@@ -44,35 +45,23 @@ export const AUTO_COMPACT_TASK = {
 	purpose: "Compact session context before it is exhausted.",
 	defaultProfile: "fast",
 } as const satisfies ModelTask;
-type AutoCompactConfig = { autoCompactThreshold: number };
 
 function isValidThreshold(value: unknown): value is number {
 	return typeof value === "number" && Number.isFinite(value) && value >= MIN_COMPACT_THRESHOLD_PERCENT && value < 100;
 }
 
-function parseAutoCompactConfig(value: unknown): AutoCompactConfig {
-	if (!value || typeof value !== "object" || Array.isArray(value)) {
-		throw new Error("Config must be an object.");
-	}
-	const threshold = (value as Record<string, unknown>).autoCompactThreshold ?? DEFAULT_COMPACT_THRESHOLD_PERCENT;
-	if (!isValidThreshold(threshold)) {
-		throw new Error(`autoCompactThreshold must be at least ${MIN_COMPACT_THRESHOLD_PERCENT} and below 100.`);
-	}
-	return { autoCompactThreshold: threshold };
-}
-
-function configuredTaskRoutes(ctx: ExtensionContext): ResolvedTaskRoute[] {
+/** `report` shows new task-model config issues before the routes resolve. */
+function configuredTaskRoutes(ctx: ExtensionContext, report: (ctx: ExtensionContext) => void): ResolvedTaskRoute[] {
+	report(ctx);
 	try {
 		return resolveConfiguredTaskRoutes(ctx, AUTO_COMPACT_TASK);
 	} catch (error) {
 		const { taskRouteCode, profileName } = error as TaskRouteError;
 		if (taskRouteCode === "config-missing") return [];
-		const cause = taskRouteCode === "profile-missing"
-			? `Task model profile ${profileName} is not configured`
-			: taskRouteCode === "no-route"
-				? `No usable ${profileName} task model route`
-				: "Couldn't read task model config";
-		ctx.ui.notify(`${cause}; using current session model.`, "error");
+		// pi-task-models messages give the path and the problems; only `no-route` gets compaction wording.
+		ctx.ui.notify(taskRouteCode === "no-route"
+			? `No usable ${profileName} task model route; using current session model.`
+			: `${error instanceof Error ? error.message : String(error)} Using current session model.`, "error");
 		return [];
 	}
 }
@@ -140,7 +129,6 @@ function keepRecent(messages: AgentMessage[], keepTokens: number): AgentMessage[
 	const userBoundaries = messages.flatMap((message, index) => message.role === "user" ? [index] : []);
 	if (userBoundaries.length === 0) return null;
 
-	let cutIndex = userBoundaries.at(-1) as number;
 	for (const boundary of userBoundaries) {
 		const removed = messages.slice(0, boundary).filter((message) => message.role !== "system");
 		if (removed.length === 0) continue;
@@ -149,25 +137,15 @@ function keepRecent(messages: AgentMessage[], keepTokens: number): AgentMessage[
 			content: `[Temporary context reduction: ${removed.length} earlier messages (~${Math.round(estimateTotalTokens(removed) / 1000)}K tokens) are omitted from this request while compaction runs. Continue with the current task.]`,
 			timestamp: Date.now(),
 		};
-		if (systemTokens + suffixTokens[boundary] + estimateMessageTokens(notice) <= keepTokens) {
-			cutIndex = boundary;
-			break;
+		if (systemTokens + suffixTokens[boundary] + estimateMessageTokens(notice) > keepTokens) continue;
+		const retained: AgentMessage[] = [];
+		for (let i = 0; i < messages.length; i++) {
+			if (i === boundary) retained.push(notice);
+			if (messages[i].role === "system" || i >= boundary) retained.push(messages[i]);
 		}
+		return retained;
 	}
-
-	const removed = messages.slice(0, cutIndex).filter((message) => message.role !== "system");
-	if (removed.length === 0) return null;
-	const notice: AgentMessage = {
-		role: "user",
-		content: `[Temporary context reduction: ${removed.length} earlier messages (~${Math.round(estimateTotalTokens(removed) / 1000)}K tokens) are omitted from this request while compaction runs. Continue with the current task.]`,
-		timestamp: Date.now(),
-	};
-	const retained: AgentMessage[] = [];
-	for (let i = 0; i < messages.length; i++) {
-		if (i === cutIndex) retained.push(notice);
-		if (messages[i].role === "system" || i >= cutIndex) retained.push(messages[i]);
-	}
-	return estimateTotalTokens(retained) <= keepTokens ? retained : null;
+	return null;
 }
 
 type BoundaryEvent = TurnEndEvent | AgentBeforeSettleEvent;
@@ -220,6 +198,20 @@ function fileOperations(messages: AgentMessage[], previous?: CompactionEntry) {
 	return { read, written, edited };
 }
 
+async function summarize(
+	ctx: ExtensionContext,
+	preparation: Parameters<typeof compact>[0],
+	model: NonNullable<ExtensionContext["model"]>,
+	thinking: ExtensionContext["thinkingLevel"],
+	signal: AbortSignal | undefined,
+) {
+	const auth = await ctx.modelRegistry.getApiKeyAndHeaders(model);
+	if (!auth.ok) throw new Error("Compaction model authentication failed.");
+	return compact(preparation, auth.baseUrl ? { ...model, baseUrl: auth.baseUrl } : model,
+		auth.apiKey, withoutDeletedHeaders(auth.headers), COMPACTION_INSTRUCTIONS,
+		signal, thinking, registryStream(ctx), auth.env);
+}
+
 /** An unchanged, successful read result with a matching persisted assistant call. */
 function readResult(entry: ProjectedSessionEntry, projected: ProjectedSessionEntry[], editedIds: Set<string>) {
 	const raw = entry.sourceEntry;
@@ -241,11 +233,23 @@ function readResult(entry: ProjectedSessionEntry, projected: ProjectedSessionEnt
 
 export default function (pi: ExtensionAPI) {
 	registerModelTask(pi, AUTO_COMPACT_TASK);
-	const configStore = createConfigStore<AutoCompactConfig>({
+	const configStore = createConfigStore({
 		extensionId: "pi-auto-compact",
-		defaults: () => ({ autoCompactThreshold: DEFAULT_COMPACT_THRESHOLD_PERCENT }),
-		parse: parseAutoCompactConfig,
+		fields: {
+			autoCompactThreshold: field(
+				parsers.number({ min: MIN_COMPACT_THRESHOLD_PERCENT, lessThan: 100 }),
+				DEFAULT_COMPACT_THRESHOLD_PERCENT,
+			),
+		},
 	});
+	// Registered before this extension's session_start handler so launch issues show first.
+	const reporter = registerConfigReporting(pi, [configStore]);
+	const reportTaskModels = registerTaskModelsConfigReporting(pi);
+	/** The config has no required or unsafe field, so a load is never disabled. */
+	const loadThreshold = () => {
+		const loaded = configStore.loadSync();
+		return { loaded, threshold: loaded.status === "ok" ? loaded.value.autoCompactThreshold : DEFAULT_COMPACT_THRESHOLD_PERCENT };
+	};
 	let active = false;
 	let autoCompactThreshold = DEFAULT_COMPACT_THRESHOLD_PERCENT;
 	// Emergency compaction interrupts a run; boundary maintenance never does.
@@ -320,8 +324,7 @@ export default function (pi: ExtensionAPI) {
 		const history = messages(start, historyEnd);
 		const prefix = cut.isSplitTurn ? messages(cut.turnStartIndex, cut.firstKeptEntryIndex) : [];
 		if (!history.length && !prefix.length) return edits.length ? { entries: [...event.entries, ...edits] } : undefined;
-		const previous = prior >= 0 && projected[prior]!.sourceEntry.type === "compaction"
-			? projected[prior]!.sourceEntry as CompactionEntry : undefined;
+		const previous = prior >= 0 ? projected[prior]!.sourceEntry as CompactionEntry : undefined;
 		const preparation = {
 			firstKeptEntryId: kept.id,
 			messagesToSummarize: history,
@@ -334,26 +337,17 @@ export default function (pi: ExtensionAPI) {
 		};
 		const signal = ctx.signal;
 		try {
-			const routes = configuredTaskRoutes(ctx);
-			const summarize = async (model: NonNullable<ExtensionContext["model"]>, thinking: ExtensionContext["thinkingLevel"]) => {
-				const auth = await ctx.modelRegistry.getApiKeyAndHeaders(model);
-				if (!auth.ok) throw new Error("Compaction model authentication failed.");
-				return compact(preparation, auth.baseUrl ? { ...model, baseUrl: auth.baseUrl } : model,
-					auth.apiKey, withoutDeletedHeaders(auth.headers), COMPACTION_INSTRUCTIONS,
-					signal, thinking, registryStream(ctx), auth.env);
-			};
+			const routes = configuredTaskRoutes(ctx, reportTaskModels);
 			let result: Awaited<ReturnType<typeof compact>> | undefined;
 			if (routes.length) {
 				try {
-					const routed = await executeTaskRoutes(routes, async (route) => ({
-						compaction: await summarize(route.model, route.thinkingLevel),
-					}), { signal, shouldFallback: () => true });
-					result = routed.compaction;
+					result = await executeTaskRoutes(routes, (route) =>
+						summarize(ctx, preparation, route.model, route.thinkingLevel, signal), { signal, shouldFallback: () => true });
 				} catch {
 					if (!signal?.aborted) ctx.ui.notify("Configured task model routes failed; using current session model.", "error");
 				}
 			}
-			if (!result && !signal?.aborted) result = await summarize(ctx.model, ctx.thinkingLevel);
+			if (!result && !signal?.aborted) result = await summarize(ctx, preparation, ctx.model, ctx.thinkingLevel, signal);
 			if (signal?.aborted || ctx.sessionManager.getSessionId() !== session || ctx.sessionManager.getLeafId() !== leaf) return;
 			if (!result?.summary.trim()) throw new Error("Compaction returned an empty summary.");
 			return { entries: [...event.entries, ...edits, {
@@ -409,7 +403,6 @@ export default function (pi: ExtensionAPI) {
 	pi.on("message_end", (event, ctx) => {
 		const message = event.message;
 		if (
-			!compactionPending ||
 			!compactionAbortExpected ||
 			!ctx.signal?.aborted ||
 			message.role !== "assistant" ||
@@ -431,7 +424,7 @@ export default function (pi: ExtensionAPI) {
 	// Runs before every provider request. Temporary truncation protects request
 	// size while asynchronous default compaction summarizes persisted history.
 	pi.on("context_with_system", (event, ctx) => {
-		if (!active || compactionPending || (failedBoundary && ctx.sessionManager &&
+		if (!active || compactionPending || (failedBoundary &&
 			failedBoundary.session === ctx.sessionManager.getSessionId() &&
 			failedBoundary.leaf === ctx.sessionManager.getLeafId())) return;
 
@@ -463,13 +456,8 @@ export default function (pi: ExtensionAPI) {
 				return;
 			}
 
-			let currentThreshold: number;
-			try {
-				currentThreshold = configStore.loadSync().value.autoCompactThreshold;
-			} catch {
-				ctx.ui.notify("Couldn't read pi-auto-compact config.", "error");
-				return;
-			}
+			const { loaded, threshold: currentThreshold } = loadThreshold();
+			reporter.report(ctx, configStore, loaded);
 
 			const input = await ctx.ui.input(
 				`Auto-compact threshold (%) · current: ${currentThreshold}`,
@@ -484,9 +472,12 @@ export default function (pi: ExtensionAPI) {
 			}
 
 			try {
-				await configStore.save({ autoCompactThreshold: threshold });
-			} catch {
-				ctx.ui.notify("Couldn't save pi-auto-compact config.", "error");
+				// The dialog can stay open while another session edits the file: merge into a clean file under the
+				// lock, and replace a file with problems (already reported above) only if it did not change meanwhile.
+				if (!loaded.issues.length) await configStore.update((latest) => ({ ...latest, autoCompactThreshold: threshold }));
+				else await configStore.replaceIfUnchanged(loaded, { autoCompactThreshold: threshold });
+			} catch (error) {
+				ctx.ui.notify(`Couldn't save pi-auto-compact config: ${error instanceof Error ? error.message : String(error)}`, "error");
 				return;
 			}
 			autoCompactThreshold = threshold;
@@ -497,13 +488,8 @@ export default function (pi: ExtensionAPI) {
 	// Pi's built-in automatic compaction competes with this extension. Refuse
 	// activation unless effective global/project settings disable it.
 	pi.on("session_start", (event, ctx) => {
-		try {
-			const config = configStore.loadSync();
-			autoCompactThreshold = config.value.autoCompactThreshold;
-		} catch {
-			autoCompactThreshold = DEFAULT_COMPACT_THRESHOLD_PERCENT;
-			ctx.ui.notify(`Couldn't read pi-auto-compact config; using ${DEFAULT_COMPACT_THRESHOLD_PERCENT}%.`, "error");
-		}
+		// Launch reporting shows config issues; invalid values use the default.
+		autoCompactThreshold = loadThreshold().threshold;
 
 		active = !SettingsManager.create(ctx.cwd, getAgentDir(), {
 			projectTrusted: ctx.isProjectTrusted(),
@@ -523,45 +509,19 @@ export default function (pi: ExtensionAPI) {
 
 		// Pi omits details from prior extension compactions when preparing next run.
 		const previous = [...event.branchEntries].reverse().find((entry) => entry.type === "compaction");
-		if (previous?.details && typeof previous.details === "object") {
-			const details = previous.details as { readFiles?: unknown; modifiedFiles?: unknown };
-			if (Array.isArray(details.readFiles)) {
-				for (const path of details.readFiles) {
-					if (typeof path === "string") event.preparation.fileOps.read.add(path);
-				}
-			}
-			if (Array.isArray(details.modifiedFiles)) {
-				for (const path of details.modifiedFiles) {
-					if (typeof path === "string") event.preparation.fileOps.edited.add(path);
-				}
-			}
-		}
+		const prior = fileOperations([], previous as CompactionEntry | undefined);
+		for (const path of prior.read) event.preparation.fileOps.read.add(path);
+		for (const path of prior.edited) event.preparation.fileOps.edited.add(path);
 
-		const routes = configuredTaskRoutes(ctx);
+		const routes = configuredTaskRoutes(ctx, reportTaskModels);
 		if (!routes.length) return;
 
 		try {
 			return await executeTaskRoutes(
 				routes,
-				async (route) => {
-					const auth = await ctx.modelRegistry.getApiKeyAndHeaders(route.model);
-					if (!auth.ok) throw new Error("Configured task model authentication failed.");
-
-					const requestModel = auth.baseUrl ? { ...route.model, baseUrl: auth.baseUrl } : route.model;
-					return {
-						compaction: await compact(
-							event.preparation,
-							requestModel,
-							auth.apiKey,
-							withoutDeletedHeaders(auth.headers),
-							event.customInstructions,
-							event.signal,
-							route.thinkingLevel,
-							registryStream(ctx),
-							auth.env,
-						),
-					};
-				},
+				async (route) => ({
+					compaction: await summarize(ctx, event.preparation, route.model, route.thinkingLevel, event.signal),
+				}),
 				{ signal: event.signal, shouldFallback: () => true },
 			);
 		} catch {

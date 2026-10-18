@@ -10,7 +10,7 @@ import {
 	type ExtensionContext,
 	type SessionEntry,
 } from "@earendil-works/pi-coding-agent";
-import { createConfigStore } from "@henryqw/pi-config-store";
+import { createConfigStore, field, parsers, registerConfigReporting } from "@henryqw/pi-config-store";
 import {
 	createEphemeralSubagentExecutor,
 	resolveRoleLaunch,
@@ -19,6 +19,7 @@ import {
 } from "@henryqw/pi-subagent";
 import {
 	registerModelTask,
+	registerTaskModelsConfigReporting,
 	type ModelTask,
 } from "@henryqw/pi-task-models";
 
@@ -35,7 +36,7 @@ const READY_WIDGET = "Prompt ready — /promptor";
 const FAILURE_WIDGET = "Prompt analysis failed — /promptor";
 const REFINEMENT_GUIDANCE = "Refine this candidate conversationally with the user. When the user approves it, Main must emit only the complete Final Prompt Draft. Then run /promptor save to use the suggested name, or /promptor save <name>.";
 
-export const DRAFT_TASK = {
+const DRAFT_TASK = {
 	id: "pi-prompt-creator/draft",
 	label: "Prompt draft",
 	purpose: "Find a reusable prompt candidate in the current conversation.",
@@ -60,16 +61,16 @@ or
 The object must have exactly these keys. name must start with a lowercase ASCII letter, use only lowercase ASCII letters, digits, and single hyphens, and be at most ${MAX_NAME_CHARS} characters. markdown must be nonempty, at most ${MAX_MARKDOWN_BYTES} UTF-8 bytes, and contain no C0 or C1 controls except tab and LF.`,
 } satisfies Role;
 
-type Config = { automatic: boolean; inputThreshold: number };
-export type PromptCandidate = { name: string; markdown: string };
+type PromptCandidate = { name: string; markdown: string };
 type ConversationItem = { role: "summary" | "user" | "assistant"; text: string };
 type ContextMessage = ReturnType<typeof buildSessionContext>["messages"][number];
+type MessageContent = Extract<ContextMessage, { role: "user" | "assistant" }>["content"];
 type ExistingPrompt = { name: string; description: string };
 type AnalysisPayload = { currentConversation: ConversationItem[]; existingPrompts: ExistingPrompt[] };
 type ActiveRun = { controller: AbortController; branchGeneration: number };
 type ReviewBoundary = { entryId: string };
 
-export interface PromptCreatorOptions {
+interface PromptCreatorOptions {
 	agentDir?: string;
 	executor?: EphemeralSubagentExecutor;
 }
@@ -79,26 +80,11 @@ function exactKeys(value: Record<string, unknown>, keys: readonly string[]): boo
 	return actual.length === keys.length && keys.every((key) => Object.hasOwn(value, key));
 }
 
-function parseConfig(value: unknown): Config {
-	if (!value || typeof value !== "object" || Array.isArray(value)) throw new Error("Config must be an object.");
-	const config = value as Record<string, unknown>;
-	const validKeys = Object.keys(config).every((key) => key === "automatic" || key === "inputThreshold");
-	const { automatic = true, inputThreshold = DEFAULT_INPUT_THRESHOLD } = config;
-	if (
-		!validKeys
-		|| typeof automatic !== "boolean"
-		|| typeof inputThreshold !== "number"
-		|| !Number.isSafeInteger(inputThreshold)
-		|| inputThreshold < 1
-	) throw new Error("Config may contain automatic:boolean and inputThreshold:positive integer.");
-	return { automatic, inputThreshold };
-}
-
-export function isPromptName(value: unknown): value is string {
+function isPromptName(value: unknown): value is string {
 	return typeof value === "string" && value.length <= MAX_NAME_CHARS && NAME.test(value);
 }
 
-export function isPromptMarkdown(value: unknown): value is string {
+function isPromptMarkdown(value: unknown): value is string {
 	return typeof value === "string"
 		&& value.trim().length > 0
 		&& Buffer.byteLength(value, "utf8") <= MAX_MARKDOWN_BYTES
@@ -121,18 +107,10 @@ export function parseDraftOutput(output: string): PromptCandidate | null {
 	return { name: candidate.name, markdown: candidate.markdown };
 }
 
-function messageText(content: unknown): string {
+function messageText(content: MessageContent): string {
 	if (typeof content === "string") return content;
 	if (!Array.isArray(content)) return "";
-	return content
-		.flatMap((part) =>
-			part && typeof part === "object" && !Array.isArray(part)
-				&& (part as Record<string, unknown>).type === "text"
-				&& typeof (part as Record<string, unknown>).text === "string"
-				? [(part as { text: string }).text]
-				: [],
-		)
-		.join("\n");
+	return content.flatMap((part) => (part.type === "text" ? [part.text] : [])).join("\n");
 }
 
 function conversationItem(message: ContextMessage): ConversationItem | undefined {
@@ -229,11 +207,7 @@ ${quotedMarkdown}
 ${REFINEMENT_GUIDANCE}`;
 }
 
-function errorCode(error: unknown): string | undefined {
-	return error && typeof error === "object" && "code" in error ? String(error.code) : undefined;
-}
-
-export async function createPromptFile(path: string, markdown: string): Promise<void> {
+async function createPromptFile(path: string, markdown: string): Promise<void> {
 	await mkdir(dirname(path), { recursive: true });
 	let file: Awaited<ReturnType<typeof open>> | undefined;
 	let created = false;
@@ -264,17 +238,20 @@ export async function createPromptFile(path: string, markdown: string): Promise<
 export default function promptCreatorExtension(pi: ExtensionAPI, options: PromptCreatorOptions = {}): void {
 	registerModelTask(pi, DRAFT_TASK);
 	const agentDir = options.agentDir ?? getAgentDir();
-	const configStore = createConfigStore<Config>({
+	const configStore = createConfigStore({
 		extensionId: EXTENSION_ID,
 		agentDir,
-		defaults: () => ({ automatic: true, inputThreshold: DEFAULT_INPUT_THRESHOLD }),
-		parse: parseConfig,
+		fields: {
+			automatic: field(parsers.boolean(), true),
+			inputThreshold: field(parsers.integer({ min: 1 }), DEFAULT_INPUT_THRESHOLD),
+		},
 	});
+	const configReporter = registerConfigReporting(pi, [configStore]);
+	const reportTaskModels = registerTaskModelsConfigReporting(pi, agentDir);
 	let executor = options.executor;
 	let automatic = false;
 	let inputThreshold = DEFAULT_INPUT_THRESHOLD;
 	let automaticConsumed = false;
-	let configWarned = false;
 	let inputCount = 0;
 	let branchGeneration = 0;
 	let candidate: PromptCandidate | undefined;
@@ -289,10 +266,10 @@ export default function promptCreatorExtension(pi: ExtensionAPI, options: Prompt
 	const showFailure = (ctx: ExtensionContext) => {
 		failure = true;
 		candidate = undefined;
-		if (ctx.mode === "tui") ctx.ui.setWidget(WIDGET_KEY, [FAILURE_WIDGET]);
+		ctx.ui.setWidget(WIDGET_KEY, [FAILURE_WIDGET]);
 	};
 	const isCurrent = (run: ActiveRun) =>
-		activeRun === run && branchGeneration === run.branchGeneration && !run.controller.signal.aborted;
+		activeRun === run && branchGeneration === run.branchGeneration;
 	const resetBranch = (ctx: ExtensionContext) => {
 		branchGeneration += 1;
 		inputCount = 0;
@@ -322,7 +299,6 @@ export default function promptCreatorExtension(pi: ExtensionAPI, options: Prompt
 		reviewBoundary = boundaryId ? { entryId: boundaryId } : undefined;
 	};
 	const startAnalysis = (ctx: ExtensionContext, manual: boolean) => {
-		if (ctx.mode !== "tui" || activeRun || candidate) return;
 		if (manual) automaticConsumed = true;
 		failure = false;
 		candidateNameHint = undefined;
@@ -340,6 +316,7 @@ export default function promptCreatorExtension(pi: ExtensionAPI, options: Prompt
 		void Promise.resolve().then(() => getExecutor().run({
 			signal: run.controller.signal,
 			prepare: async () => {
+				reportTaskModels(ctx);
 				const launch = resolveRoleLaunch(pi, ctx, {
 					role: DRAFT_ROLE,
 					task: DRAFT_TASK,
@@ -391,7 +368,7 @@ export default function promptCreatorExtension(pi: ExtensionAPI, options: Prompt
 			await createPromptFile(path, draft);
 		} catch (error) {
 			ctx.ui.notify(
-				errorCode(error) === "EEXIST" ? `Prompt /${name} already exists.` : `Could not save /${name}.`,
+				(error as NodeJS.ErrnoException).code === "EEXIST" ? `Prompt /${name} already exists.` : `Could not save /${name}.`,
 				"error",
 			);
 			return;
@@ -409,18 +386,11 @@ export default function promptCreatorExtension(pi: ExtensionAPI, options: Prompt
 		activeRun?.controller.abort(new Error("Prompt Creator session changed."));
 		activeRun = undefined;
 		resetBranch(ctx);
-		try {
-			const config = configStore.loadSync().value;
-			automatic = config.automatic;
-			inputThreshold = config.inputThreshold;
-		} catch {
-			automatic = false;
-			inputThreshold = DEFAULT_INPUT_THRESHOLD;
-			if (!configWarned) {
-				configWarned = true;
-				ctx.ui.notify("Prompt Creator config is invalid. Automatic analysis is disabled; the file was left unchanged.", "warning");
-			}
-		}
+		const loaded = configStore.loadSync();
+		configReporter.report(ctx, configStore, loaded);
+		// A file-level problem or an invalid or misspelled `automatic` keeps automatic analysis off; a missing file uses the default.
+		automatic = loaded.status === "ok" && loaded.value.automatic && !loaded.issues.some(({ key }) => key === "" || key === "automatic");
+		inputThreshold = loaded.status === "ok" ? loaded.value.inputThreshold : DEFAULT_INPUT_THRESHOLD;
 	});
 
 	pi.on("input", (event, ctx) => {
@@ -433,9 +403,10 @@ export default function promptCreatorExtension(pi: ExtensionAPI, options: Prompt
 		return { action: "continue" };
 	});
 
-	pi.on("agent_settled", (_event, ctx) => {
+	pi.on("agent_settled", (event, ctx) => {
 		if (
-			ctx.mode !== "tui"
+			event.aborted
+			|| ctx.mode !== "tui"
 			|| !ctx.isIdle()
 			|| !automatic
 			|| automaticConsumed
@@ -502,11 +473,20 @@ export default function promptCreatorExtension(pi: ExtensionAPI, options: Prompt
 			if (action === "automatic" && values.length === 1 && (values[0] === "on" || values[0] === "off")) {
 				const next = values[0] === "on";
 				try {
-					await configStore.save({ automatic: next, inputThreshold });
+					// Write the latest file, not the session's cached threshold, and report its problems first.
+					const loaded = configStore.loadSync();
+					configReporter.report(ctx, configStore, loaded);
+					// No field disables this config, so a load always has a value.
+					if (loaded.status !== "ok") return;
+					let written = { ...loaded.value, automatic: next };
+					if (!loaded.issues.length) written = await configStore.update((latest) => ({ ...latest, automatic: next }));
+					// A file with problems is replaced with its usable values, and only if no other session changed it meanwhile.
+					else await configStore.replaceIfUnchanged(loaded, written);
 					automatic = next;
+					inputThreshold = written.inputThreshold;
 					ctx.ui.notify(`Automatic analysis ${next ? "enabled" : "disabled"}.`, "info");
-				} catch {
-					ctx.ui.notify("Could not save Prompt Creator config.", "error");
+				} catch (error) {
+					ctx.ui.notify(`Could not save Prompt Creator config: ${error instanceof Error ? error.message : String(error)}`, "error");
 				}
 				return;
 			}
